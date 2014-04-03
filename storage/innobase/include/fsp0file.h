@@ -40,8 +40,8 @@ enum device_t {
 };
 
 /** Data file control information. */
-class Datafile
-{
+class Datafile {
+
 	friend class Tablespace;
 	friend class SysTablespace;
 
@@ -64,6 +64,7 @@ public:
 		m_is_valid(),
 		m_first_page_buf(),
 		m_first_page(),
+		m_atomic_write(),
 		m_last_os_error()
 	{
 		/* No op */
@@ -86,6 +87,7 @@ public:
 		m_is_valid(),
 		m_first_page_buf(),
 		m_first_page(),
+		m_atomic_write(),
 		m_last_os_error()
 
 	{
@@ -107,6 +109,7 @@ public:
 		m_is_valid(file.m_is_valid),
 		m_first_page_buf(),
 		m_first_page(),
+		m_atomic_write(file.m_atomic_write),
 		m_last_os_error()
 	{
 		m_name = ::strdup(file.m_name);
@@ -166,6 +169,8 @@ public:
 		it should be reread if needed */
 		m_first_page_buf = NULL;
 		m_first_page = NULL;
+
+		m_atomic_write = file.m_atomic_write;
 
 		return(*this);
 	}
@@ -431,6 +436,9 @@ private:
 
 	/** Pointer to the first page held in the buffer above */
 	byte*			m_first_page;
+
+	/** true if atomic writes enabled for this file */
+	bool			m_atomic_write;
 
 protected:
 	/** Last OS error recieved so it can be reported if needed. */

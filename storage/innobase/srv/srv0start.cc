@@ -99,6 +99,11 @@ Created 2/16/1996 Heikki Tuuri
 # include "zlib.h"
 # include "ut0crc32.h"
 
+#ifdef HAVE_LZO1X
+#include <lzo/lzo1x.h>
+extern bool srv_lzo_disabled;
+#endif /* HAVE_LZO1X */
+
 /** Log sequence number immediately after startup */
 lsn_t	srv_start_lsn;
 /** Log sequence number at shutdown */
@@ -415,18 +420,21 @@ create_log_files(
 
 	logfile0 = fil_node_create(
 		logfilename, (ulint) srv_log_file_size,
-		log_space, false);
+		log_space, false, false);
 	ut_a(logfile0);
 
 	for (unsigned i = 1; i < srv_n_log_files; i++) {
+
 		sprintf(logfilename + dirnamelen, "ib_logfile%u", i);
 
 		if (!fil_node_create(logfilename,
 				     (ulint) srv_log_file_size,
-				     log_space, false)) {
+				     log_space, false, false)) {
+
 			ib_logf(IB_LOG_LEVEL_ERROR,
 				"Cannot create file node for log file %s",
 				logfilename);
+
 			return(DB_ERROR);
 		}
 	}
@@ -441,10 +449,10 @@ create_log_files(
 	fil_open_log_and_system_tablespace_files();
 
 	/* Create a log checkpoint. */
-	mutex_enter(&log_sys->mutex);
+	log_mutex_enter();
 	ut_d(recv_no_log_write = FALSE);
 	recv_reset_logs(lsn);
-	mutex_exit(&log_sys->mutex);
+	log_mutex_exit();
 
 	return(DB_SUCCESS);
 }
@@ -476,7 +484,7 @@ create_log_files_rename(
 	ib_logf(IB_LOG_LEVEL_INFO,
 		"Renaming log file %s to %s", logfile0, logfilename);
 
-	mutex_enter(&log_sys->mutex);
+	log_mutex_enter();
 	ut_ad(strlen(logfile0) == 2 + strlen(logfilename));
 	bool success = os_file_rename(
 		innodb_log_file_key, logfile0, logfilename);
@@ -486,7 +494,7 @@ create_log_files_rename(
 
 	/* Replace the first file with ib_logfile0. */
 	strcpy(logfile0, logfilename);
-	mutex_exit(&log_sys->mutex);
+	log_mutex_exit();
 
 	fil_open_log_and_system_tablespace_files();
 
@@ -622,10 +630,16 @@ srv_undo_tablespace_open(
 		os_offset_t	size;
 		fil_space_t*	space;
 
+		bool	atomic_write;
+
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 		if (!srv_use_doublewrite_buf) {
-			fil_fusionio_enable_atomic_write(fh);
+			atomic_write = fil_fusionio_enable_atomic_write(fh);
+		} else {
+			atomic_write = false;
 		}
+#else
+		atomic_write = false;
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
 
 		size = os_file_get_size(fh);
@@ -657,7 +671,9 @@ srv_undo_tablespace_open(
 		is 64 bit. It is OK to cast the n_pages to ulint because
 		the unit has been scaled to pages and they are always
 		32 bit. */
-		if (fil_node_create(name, (ulint) n_pages, space, false)) {
+		if (fil_node_create(
+			name, (ulint) n_pages, space, false, atomic_write)) {
+
 			err = DB_SUCCESS;
 		}
 	}
@@ -1198,6 +1214,26 @@ innobase_start_or_create_for_mysql(void)
 #endif /* PAGE_ATOMIC_REF_COUNT */
 	);
 
+#ifdef HAVE_LZO1X
+	if (lzo_init() != LZO_E_OK) {
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"lzo_init() failed, support disabled");
+		srv_lzo_disabled = true;
+	} else {
+		ib_logf(IB_LOG_LEVEL_INFO, "LZO1X support available");
+		srv_lzo_disabled = false;
+	}
+#endif /* HAVE_LZO1X */
+
+#ifdef HAVE_LZ4
+	ib_logf(IB_LOG_LEVEL_INFO, "LZ4 support available");
+#endif /* HAVE_LZ4 */
+
+#ifdef HAVE_FALLOC_PUNCH_HOLE_AND_KEEP_SIZE
+	ib_logf(IB_LOG_LEVEL_INFO, "PUNCH HOLE support available");
+#else
+	ib_logf(IB_LOG_LEVEL_INFO, "PUNCH HOLE support not available");
+#endif /* HAVE_FALLOC_PUNCH_HOLE_AND_KEEP_SIZE */
 
 	if (sizeof(ulint) != sizeof(void*)) {
 		ib_logf(IB_LOG_LEVEL_ERROR,
@@ -1275,11 +1311,6 @@ innobase_start_or_create_for_mysql(void)
 
 	srv_start_has_been_called = TRUE;
 
-#ifdef UNIV_DEBUG
-	log_do_write = TRUE;
-#endif /* UNIV_DEBUG */
-	/*	yydebug = TRUE; */
-
 	srv_is_being_started = true;
 	srv_startup_is_before_trx_rollback_phase = TRUE;
 
@@ -1323,11 +1354,8 @@ innobase_start_or_create_for_mysql(void)
 
 	if (srv_file_flush_method_str == NULL) {
 		/* These are the default options */
-
-		srv_unix_file_flush_method = SRV_UNIX_FSYNC;
-
-		srv_win_file_flush_method = SRV_WIN_IO_UNBUFFERED;
 #ifndef _WIN32
+		srv_unix_file_flush_method = SRV_UNIX_FSYNC;
 	} else if (0 == ut_strcmp(srv_file_flush_method_str, "fsync")) {
 		srv_unix_file_flush_method = SRV_UNIX_FSYNC;
 
@@ -1346,6 +1374,7 @@ innobase_start_or_create_for_mysql(void)
 	} else if (0 == ut_strcmp(srv_file_flush_method_str, "nosync")) {
 		srv_unix_file_flush_method = SRV_UNIX_NOSYNC;
 #else
+		srv_win_file_flush_method = SRV_WIN_IO_UNBUFFERED;
 	} else if (0 == ut_strcmp(srv_file_flush_method_str, "normal")) {
 		srv_win_file_flush_method = SRV_WIN_IO_NORMAL;
 		srv_use_native_aio = FALSE;
@@ -1593,6 +1622,11 @@ innobase_start_or_create_for_mysql(void)
 	lock_sys_create(srv_lock_table_size);
 	srv_start_state_set(SRV_START_STATE_LOCK_SYS);
 
+#ifdef UNIV_SYNC_DEBUG
+	/* Switch latching order checks on in sync0debug.cc */
+	sync_check_enable();
+#endif /* UNIV_SYNC_DEBUG */
+
 	/* Create i/o-handler threads: */
 
 	for (ulint t = 0; t < srv_n_file_io_threads; ++t) {
@@ -1831,7 +1865,7 @@ innobase_start_or_create_for_mysql(void)
 
 			if (!fil_node_create(logfilename,
 					     (ulint) srv_log_file_size,
-					     log_space, false)) {
+					     log_space, false, false)) {
 				return(srv_init_abort(DB_ERROR));
 			}
 		}
@@ -1917,10 +1951,6 @@ files_checked:
 
 		create_log_files_rename(
 			logfilename, dirnamelen, max_flushed_lsn, logfile0);
-#ifdef UNIV_SYNC_DEBUG
-		/* Switch latching order checks on in sync0debug.cc. */
-		sync_check_enable();
-#endif /* UNIV_SYNC_DEBUG */
 
 	} else {
 
@@ -1965,24 +1995,41 @@ files_checked:
 		err = recv_recovery_from_checkpoint_start(
 			min_flushed_lsn, max_flushed_lsn);
 
-		if (err != DB_SUCCESS) {
+		if (err == DB_SUCCESS) {
+			/* Initialize the change buffer. */
+			err = dict_boot();
+		}
 
+		if (err != DB_SUCCESS) {
 			return(srv_init_abort(DB_ERROR));
 		}
 
-		/* Since the insert buffer init is in dict_boot, and the
-		insert buffer is needed in any disk i/o, first we call
-		dict_boot(). Note that trx_sys_init_at_db_start() only needs
-		to access space 0, and the insert buffer at this stage already
-		works for space 0. */
+		purge_queue = trx_sys_init_at_db_start();
 
-		err = dict_boot();
+		if (srv_force_recovery < SRV_FORCE_NO_LOG_REDO) {
+			/* Apply the hashed log records to the
+			respective file pages, for the last batch of
+			recv_group_scan_log_recs(). */
 
-		if (err != DB_SUCCESS) {
-			return(srv_init_abort(err));
+			recv_apply_hashed_log_recs(TRUE);
+			DBUG_PRINT("ib_log", ("apply completed"));
+
+			if (recv_needed_recovery) {
+				trx_sys_print_mysql_binlog_offset();
+			}
 		}
 
-		purge_queue = trx_sys_init_at_db_start();
+		if (recv_sys->found_corrupt_log) {
+			ib_logf(IB_LOG_LEVEL_WARN,
+				"The log file may have been corrupt and it"
+				" is possible that the log scan or parsing"
+				" did not proceed far enough in recovery."
+				" Please run CHECK TABLE on your InnoDB tables"
+				" to check that they are ok!"
+				" It may be safest to recover your"
+				" InnoDB database from a backup!");
+		}
+
 		n_recovered_trx = UT_LIST_GET_LEN(trx_sys->rw_trx_list);
 
 		/* The purge system needs to create the purge view and
@@ -2114,11 +2161,6 @@ files_checked:
 		}
 
 		srv_startup_is_before_trx_rollback_phase = FALSE;
-
-#ifdef UNIV_SYNC_DEBUG
-		/* Switch latching order checks on in sync0debug.cc */
-		sync_check_enable();
-#endif /* UNIV_SYNC_DEBUG */
 
 		recv_recovery_rollback_active();
 
@@ -2372,9 +2414,9 @@ files_checked:
 	}
 
 	if (srv_print_verbose_log) {
-		ib_logf(IB_LOG_LEVEL_INFO,
-			"%s started; log sequence number " LSN_PF "",
-			INNODB_VERSION_STR, srv_start_lsn);
+		ib::info() << INNODB_VERSION_STR
+			<< " started; log sequence number "
+			<< srv_start_lsn;
 	}
 
 	if (srv_force_recovery > 0) {

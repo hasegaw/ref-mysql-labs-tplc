@@ -517,24 +517,24 @@ buf_page_is_corrupted(
 
 #if !defined(UNIV_HOTBACKUP) && !defined(UNIV_INNOCHECKSUM)
 	if (check_lsn && recv_lsn_checks_on) {
-		lsn_t	current_lsn;
+		lsn_t		current_lsn;
+		const lsn_t	page_lsn
+			= mach_read_from_8(read_buf + FIL_PAGE_LSN);
 
 		/* Since we are going to reset the page LSN during the import
 		phase it makes no sense to spam the log with error messages. */
 
-		if (log_peek_lsn(&current_lsn)
-		    && current_lsn
-		    < mach_read_from_8(read_buf + FIL_PAGE_LSN)) {
-
+		if (log_peek_lsn(&current_lsn) && current_lsn < page_lsn) {
 			ib_logf(IB_LOG_LEVEL_ERROR,
-				"Page %lu log sequence number"
-				" " LSN_PF
+				"Page " ULINTPF ":" ULINTPF
+				" log sequence number " LSN_PF
 				" is in the future! Current system"
 				" log sequence number " LSN_PF ".",
-				(ulong) mach_read_from_4(
+				mach_read_from_4(
+					read_buf + FIL_PAGE_SPACE_ID),
+				mach_read_from_4(
 					read_buf + FIL_PAGE_OFFSET),
-				(lsn_t) mach_read_from_8(
-					read_buf + FIL_PAGE_LSN),
+				page_lsn,
 				current_lsn);
 			ib_logf(IB_LOG_LEVEL_ERROR,
 				"Your database may be corrupt or"
@@ -571,19 +571,24 @@ buf_page_is_corrupted(
 	checksum_field2 = mach_read_from_4(
 		read_buf + page_size.logical() - FIL_PAGE_END_LSN_OLD_CHKSUM);
 
-	/* declare empty pages non-corrupted */
-	if (checksum_field1 == 0 && checksum_field2 == 0
+	/* Ignore empty pages */
+	if (checksum_field1 == 0
+	    && checksum_field2 == 0
 	    && mach_read_from_4(read_buf + FIL_PAGE_LSN) == 0) {
 		/* make sure that the page is really empty */
 
-#ifdef UNIV_INNOCHECKSUM
 		ulint	i;
 
-		for (i = 0; i < page_size.logical(); i++) {
-			if (read_buf[i] != 0)
-				break;
-		}
+		for (i = 0; i < page_size.logical(); ++i) {
+			if ((i < FIL_PAGE_FILE_FLUSH_LSN
+			     || i >= FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID)
+			    && read_buf[i] != 0) {
 
+				fprintf(stderr, "i=%lu\n", i);
+				break;
+			}
+		}
+#ifdef UNIV_INNOCHECKSUM
 		if (i >= page_size.logical()) {
 			if (is_log_enabled) {
 				fprintf(log_file, "Page::%" PRIuMAX
@@ -593,15 +598,8 @@ buf_page_is_corrupted(
 			return(FALSE);
 		}
 #else
-		for (ulint i = 0; i < page_size.logical(); i++) {
-			if (read_buf[i] != 0) {
-				return(TRUE);
-			}
-		}
-
-		return(FALSE);
+		return(i < page_size.logical() ? TRUE : FALSE);
 #endif /* UNIV_INNOCHECKSUM */
-
 	}
 
 	switch ((srv_checksum_algorithm_t) srv_checksum_algorithm) {
@@ -1441,6 +1439,9 @@ buf_pool_init_instance(
 
 	buf_pool->watch = (buf_page_t*) ut_zalloc(
 		sizeof(*buf_pool->watch) * BUF_POOL_WATCH_SIZE);
+	for (i = 0; i < BUF_POOL_WATCH_SIZE; i++) {
+		buf_pool->watch[i].buf_pool_index = buf_pool->instance_no;
+	}
 
 	/* All fields are initialized by ut_zalloc(). */
 
@@ -1710,7 +1711,7 @@ buf_relocate(
 #endif /* UNIV_LRU_DEBUG */
 	}
 
-        ut_d(UT_LIST_VALIDATE(buf_pool->LRU, CheckInLRUList()));
+	ut_d(UT_LIST_VALIDATE(buf_pool->LRU, CheckInLRUList()));
 
 	/* relocate buf_pool->page_hash */
 	ulint	fold = bpage->id.fold();
@@ -1975,7 +1976,7 @@ buf_pool_watch_remove(
 }
 
 /** Stop watching if the page has been read in.
-buf_pool_watch_set(space,offset) must have returned NULL before.
+buf_pool_watch_set(same_page_id) must have returned NULL before.
 @param[in]	page_id	page id */
 void
 buf_pool_watch_unset(
@@ -2020,8 +2021,8 @@ buf_pool_watch_unset(
 }
 
 /** Check if the page has been read in.
-This may only be called after buf_pool_watch_set(space,offset)
-has returned NULL and before invoking buf_pool_watch_unset(space,offset).
+This may only be called after buf_pool_watch_set(same_page_id)
+has returned NULL and before invoking buf_pool_watch_unset(same_page_id).
 @param[in]	page_id	page id
 @return FALSE if the given page was not read in, TRUE if it was */
 ibool
@@ -2409,7 +2410,7 @@ in this buffer pool instance.
 buf_block_t*
 buf_block_align_instance(
 /*=====================*/
- 	buf_pool_t*	buf_pool,	/*!< in: buffer in which the block
+	buf_pool_t*	buf_pool,	/*!< in: buffer in which the block
 					resides */
 	const byte*	ptr)		/*!< in: pointer to a frame */
 {
@@ -2641,7 +2642,7 @@ buf_wait_for_read(
 
 		BPageMutex*	mutex = buf_page_get_mutex(&block->page);
 
-		for (;;) {
+		for (int count = 0;; ++count) {
 			buf_io_fix	io_fix;
 
 			mutex_enter(mutex);
@@ -2650,12 +2651,20 @@ buf_wait_for_read(
 
 			mutex_exit(mutex);
 
-			if (io_fix == BUF_IO_READ) {
+			if (io_fix != BUF_IO_READ) {
+				break;
+			}
+
+			if (!(count & 23)) {
 				/* Wait by temporaly s-latch */
 				rw_lock_s_lock(&block->lock);
 				rw_lock_s_unlock(&block->lock);
+
+			} else if (!(++count % 11)) {
+
+				os_thread_yield();
 			} else {
-				break;
+				UT_RELAX_CPU();
 			}
 		}
 	}
@@ -4064,6 +4073,8 @@ buf_page_create(
 	Then InnoDB could in a crash recovery print a big, false, corruption
 	warning if the stamp contains an lsn bigger than the ib_logfile lsn. */
 
+	/* These 8 bytes are also repurposed for PageIO compression and must
+	be reset when the frame is assigned to a new page id. See fil0fil.h.*/
 	memset(frame + FIL_PAGE_FILE_FLUSH_LSN, 0, 8);
 
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
@@ -4128,49 +4139,49 @@ buf_page_monitor(
 		}
 		break;
 
-        case FIL_PAGE_UNDO_LOG:
+	case FIL_PAGE_UNDO_LOG:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_UNDO_LOG_PAGE);
 		break;
 
-        case FIL_PAGE_INODE:
+	case FIL_PAGE_INODE:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_INODE_PAGE);
 		break;
 
-        case FIL_PAGE_IBUF_FREE_LIST:
+	case FIL_PAGE_IBUF_FREE_LIST:
 		counter = MONITOR_RW_COUNTER(io_type,
 					     MONITOR_IBUF_FREELIST_PAGE);
 		break;
 
-        case FIL_PAGE_IBUF_BITMAP:
+	case FIL_PAGE_IBUF_BITMAP:
 		counter = MONITOR_RW_COUNTER(io_type,
 					     MONITOR_IBUF_BITMAP_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_SYS:
+	case FIL_PAGE_TYPE_SYS:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_SYSTEM_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_TRX_SYS:
+	case FIL_PAGE_TYPE_TRX_SYS:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_TRX_SYSTEM_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_FSP_HDR:
+	case FIL_PAGE_TYPE_FSP_HDR:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_FSP_HDR_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_XDES:
+	case FIL_PAGE_TYPE_XDES:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_XDES_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_BLOB:
+	case FIL_PAGE_TYPE_BLOB:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_BLOB_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_ZBLOB:
+	case FIL_PAGE_TYPE_ZBLOB:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_ZBLOB_PAGE);
 		break;
 
-        case FIL_PAGE_TYPE_ZBLOB2:
+	case FIL_PAGE_TYPE_ZBLOB2:
 		counter = MONITOR_RW_COUNTER(io_type, MONITOR_ZBLOB2_PAGE);
 		break;
 
@@ -5113,18 +5124,19 @@ Returns the ratio in percents of modified pages in the buffer pool /
 database pages in the buffer pool.
 @return modified page percentage ratio */
 
-ulint
+double
 buf_get_modified_ratio_pct(void)
 /*============================*/
 {
-	ulint		ratio;
+	double		ratio;
 	ulint		lru_len = 0;
 	ulint		free_len = 0;
 	ulint		flush_list_len = 0;
 
 	buf_get_total_list_len(&lru_len, &free_len, &flush_list_len);
 
-	ratio = (100 * flush_list_len) / (1 + lru_len + free_len);
+	ratio = static_cast<double>(100 * flush_list_len)
+		/ (1 + lru_len + free_len);
 
 	/* 1 + is there to avoid division by zero */
 
@@ -5568,6 +5580,27 @@ buf_get_free_list_len(void)
 	return(len);
 }
 #endif
+
+/**
+@return true if we should do a sync IO */
+
+bool
+buf_get_aio_sync_flag(const buf_page_t* bpage)
+{
+	if (ibuf_bitmap_page(bpage->id, bpage->size)
+	    || trx_sys_hdr_page(bpage->id)) {
+
+		/* Trx sys header is so low in the latching order
+		that we play safe and do not leave the i/o-completion
+		to an asynchronous i/o-thread. Ibuf bitmap pages must
+		always be read with syncronous i/o, to make sure they
+		do not get involved in thread deadlocks. */
+
+		return(true);
+	} else {
+		return(!srv_read_async);
+	}
+}
 
 #else /* !UNIV_HOTBACKUP */
 

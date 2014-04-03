@@ -49,7 +49,7 @@ reads to fail. If you set the buffer size to be greater than a multiple of the
 file size then it will assert. TODO: Fix this limitation of the IO functions.
 @param n page size of the tablespace.
 @retval number of pages */
-#define IO_BUFFER_SIZE(n)	((1024 * 1024) / n)
+#define IO_BUFFER_SIZE(m, n)	((m) / (n))
 
 /** For gathering stats on records during phase I */
 struct row_stats_t {
@@ -1928,9 +1928,6 @@ PageConverter::update_header(
 		return(DB_UNSUPPORTED);
 	}
 
-	mach_write_to_8(
-		get_frame(block) + FIL_PAGE_FILE_FLUSH_LSN, m_current_lsn);
-
 	/* Write space_id to the tablespace header, page 0. */
 	mach_write_to_4(
 		get_frame(block) + FSP_HEADER_OFFSET + FSP_SPACE_ID,
@@ -2028,21 +2025,9 @@ PageConverter::validate(
 		return(IMPORT_PAGE_STATUS_CORRUPTED);
 
 	} else if (offset > 0 && page_get_page_no(page) == 0) {
-		const byte*	b = page;
-		const byte*	e = b + m_page_size.physical();
 
-		/* If the page number is zero and offset > 0 then
-		the entire page MUST consist of zeroes. If not then
-		we flag it as corrupt. */
-
-		while (b != e) {
-
-			if (*b++ && !trigger_corruption()) {
-				return(IMPORT_PAGE_STATUS_CORRUPTED);
-			}
-		}
-
-		/* The page is all zero: do nothing. */
+		/* The page is all zero: do nothing. We already checked
+		for all NULs in buf_page_is_corrupted() */
 		return(IMPORT_PAGE_STATUS_ALL_ZERO);
 	}
 
@@ -3516,7 +3501,9 @@ row_import_for_mysql(
 		FetchIndexRootPages	fetchIndexRootPages(table, trx);
 
 		err = fil_tablespace_iterate(
-			table, IO_BUFFER_SIZE(cfg.m_page_size.physical()),
+			table, IO_BUFFER_SIZE(
+				cfg.m_page_size.physical(),
+				cfg.m_page_size.physical()),
 			fetchIndexRootPages);
 
 		if (err == DB_SUCCESS) {
@@ -3552,7 +3539,9 @@ row_import_for_mysql(
 	/* Set the IO buffer size in pages. */
 
 	err = fil_tablespace_iterate(
-		table, IO_BUFFER_SIZE(cfg.m_page_size.physical()), converter);
+		table, IO_BUFFER_SIZE(
+			cfg.m_page_size.physical(),
+			cfg.m_page_size.physical()), converter);
 
 	DBUG_EXECUTE_IF("ib_import_reset_space_and_lsn_failure",
 			err = DB_TOO_MANY_CONCURRENT_TRXS;);
@@ -3599,7 +3588,7 @@ row_import_for_mysql(
 	fil_space_set_imported() to declare it a persistent tablespace. */
 
 	err = fil_open_single_table_tablespace(
-		true, true, FIL_TYPE_TEMPORARY, table->space,
+		true, true, FIL_TYPE_IMPORT, table->space,
 		dict_tf_to_fsp_flags(table->flags),
 		table->name, filepath);
 

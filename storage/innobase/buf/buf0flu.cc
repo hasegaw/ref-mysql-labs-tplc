@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -950,9 +950,19 @@ buf_flush_write_block_low(
 	}
 
 	if (!srv_use_doublewrite_buf || !buf_dblwr) {
-		fil_io(OS_FILE_WRITE | OS_AIO_SIMULATED_WAKE_LATER,
+
+		ulint	type = IORequest::WRITE | IORequest::DO_NOT_WAKE;
+
+		if (!bpage->size.is_compressed()) {
+			type |= IORequest::COMPRESS;
+		}
+
+		IORequest	request(type);
+
+		fil_io(request,
 		       sync, bpage->id, bpage->size, 0, bpage->size.physical(),
 		       frame, bpage);
+
 	} else if (flush_type == BUF_FLUSH_SINGLE_PAGE) {
 		buf_dblwr_write_single_page(bpage, sync);
 	} else {
@@ -2004,8 +2014,10 @@ buf_flush_single_page_from_LRU(
 			Note: There is no guarantee that this page has actually
 			been freed, only that it has been flushed to disk */
 
+			bool	sync = buf_get_aio_sync_flag(bpage);
+
 			freed = buf_flush_page(
-				buf_pool, bpage, BUF_FLUSH_SINGLE_PAGE, true);
+				buf_pool, bpage, BUF_FLUSH_SINGLE_PAGE, sync);
 
 			if (freed) {
 				break;
@@ -2156,7 +2168,12 @@ ulint
 af_get_pct_for_dirty()
 /*==================*/
 {
-	ulint dirty_pct = buf_get_modified_ratio_pct();
+	double	dirty_pct = buf_get_modified_ratio_pct();
+
+	if (dirty_pct == 0.0) {
+		/* No pages modified */
+		return(0);
+	}
 
 	ut_a(srv_max_dirty_pages_pct_lwm
 	     <= srv_max_buf_pool_modified_pct);
@@ -2164,19 +2181,20 @@ af_get_pct_for_dirty()
 	if (srv_max_dirty_pages_pct_lwm == 0) {
 		/* The user has not set the option to preflush dirty
 		pages as we approach the high water mark. */
-		if (dirty_pct > srv_max_buf_pool_modified_pct) {
+		if (dirty_pct >= srv_max_buf_pool_modified_pct) {
 			/* We have crossed the high water mark of dirty
 			pages In this case we start flushing at 100% of
 			innodb_io_capacity. */
 			return(100);
 		}
-	} else if (dirty_pct > srv_max_dirty_pages_pct_lwm) {
+	} else if (dirty_pct >= srv_max_dirty_pages_pct_lwm) {
 		/* We should start flushing pages gradually. */
-		return((dirty_pct * 100)
-		       / (srv_max_buf_pool_modified_pct + 1));
+		dirty_pct = srv_max_buf_pool_modified_pct;
+	} else {
+		dirty_pct = srv_max_dirty_pages_pct_lwm;
 	}
 
-	return(0);
+	return(dirty_pct);
 }
 
 /*********************************************************************//**
@@ -2485,7 +2503,7 @@ pc_flush_slot(void)
 			os_event_reset(page_cleaner->is_requested);
 		}
 
-		if (srv_shutdown_state != SRV_SHUTDOWN_NONE) {
+		if (srv_shutdown_state >= SRV_SHUTDOWN_FLUSH_DONE) {
 			slot->n_flushed_lru = 0;
 			slot->n_flushed_list = 0;
 			goto finish_mutex;
@@ -2496,7 +2514,7 @@ pc_flush_slot(void)
 		/* Flush pages from end of LRU if required */
 		slot->n_flushed_lru = buf_flush_LRU_list(buf_pool);
 
-		if (srv_shutdown_state != SRV_SHUTDOWN_NONE) {
+		if (srv_shutdown_state >= SRV_SHUTDOWN_FLUSH_DONE) {
 			slot->n_flushed_list = 0;
 			goto finish;
 		}
@@ -2603,40 +2621,47 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 
 	ulint		ret_sleep = 0;
 	ib_int64_t	sig_count = os_event_reset(buf_flush_event);
-	while (srv_shutdown_state == SRV_SHUTDOWN_NONE) {
+
+	while (true) {
 
 		/* The page_cleaner skips sleep if the server is
 		idle and there are no pending IOs in the buffer pool
 		and there is work to do. */
-		if (srv_check_activity(last_activity)
-		    || buf_get_n_pending_read_ios()
-		    || n_flushed == 0) {
+		if (srv_shutdown_state == SRV_SHUTDOWN_NONE) {
+			if (srv_check_activity(last_activity)
+			    || buf_get_n_pending_read_ios()
+			    || n_flushed == 0) {
 
-			ret_sleep = pc_sleep_if_needed(
-				next_loop_time, sig_count);
+				ret_sleep = pc_sleep_if_needed(
+					next_loop_time, sig_count);
 
-			if (srv_shutdown_state != SRV_SHUTDOWN_NONE) {
-				break;
+			} else if (ut_time_ms() > next_loop_time) {
+				ret_sleep = OS_SYNC_TIME_EXCEEDED;
+			} else {
+				ret_sleep = 0;
 			}
-		} else if (ut_time_ms() > next_loop_time) {
-			ret_sleep = OS_SYNC_TIME_EXCEEDED;
+
+			sig_count = os_event_reset(buf_flush_event);
+
+			if (ret_sleep == OS_SYNC_TIME_EXCEEDED) {
+				next_loop_time = ut_time_ms() + 1000;
+			}
 		} else {
 			ret_sleep = 0;
+			sig_count = os_event_reset(buf_flush_event);
 		}
 
-		sig_count = os_event_reset(buf_flush_event);
+		if (srv_check_activity(last_activity)
+		    || srv_shutdown_state != SRV_SHUTDOWN_NONE) {
 
-		if (ret_sleep == OS_SYNC_TIME_EXCEEDED) {
-			next_loop_time = ut_time_ms() + 1000;
-		}
-
-		if (srv_check_activity(last_activity)) {
 			ulint	n_to_flush;
 			lsn_t	lsn_limit = 0;
 
 			/* Estimate pages from flush_list to be flushed */
 			if (ret_sleep == OS_SYNC_TIME_EXCEEDED) {
+
 				last_activity = srv_get_activity_count();
+
 				n_to_flush =
 					page_cleaner_flush_pages_recommendation(
 						&lsn_limit, last_pages);
@@ -2647,23 +2672,34 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 			/* Request flushing for threads */
 			pc_request(n_to_flush, lsn_limit);
 
-			/* Coordinator also treats requests */
-			while (pc_flush_slot() > 0) {}
+			/* Flush only if single cleaner thread configured */
+			while (pc_flush_slot() > 0) {
+				/* No op */
+			}
 
 			/* Wait for all slots to be finished */
 			ulint	n_flushed_lru = 0;
 			ulint	n_flushed_list = 0;
+
 			pc_wait_finished(&n_flushed_lru, &n_flushed_list);
 
-			if (n_flushed_list || n_flushed_lru) {
+			n_flushed = n_flushed_lru + n_flushed_list;
+
+			if (n_flushed > 0) {
+
 				buf_flush_stats(n_flushed_list, n_flushed_lru);
+
+			} else if (srv_shutdown_state
+				   == SRV_SHUTDOWN_FLUSH_PHASE) {
+
+				srv_shutdown_state = SRV_SHUTDOWN_FLUSH_DONE;
+
+				break;
 			}
 
 			if (ret_sleep == OS_SYNC_TIME_EXCEEDED) {
 				last_pages = n_flushed_list;
 			}
-
-			n_flushed = n_flushed_lru + n_flushed_list;
 
 			if (n_flushed_lru) {
 				MONITOR_INC_VALUE_CUMULATIVE(
@@ -2680,17 +2716,23 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 					MONITOR_FLUSH_ADAPTIVE_PAGES,
 					n_flushed_list);
 			}
-		} else if (ret_sleep == OS_SYNC_TIME_EXCEEDED) {
+
+		} else if (ret_sleep == OS_SYNC_TIME_EXCEEDED
+			   && srv_shutdown_state == SRV_SHUTDOWN_NONE) {
+
 			/* no activity, slept enough */
 			buf_flush_lists(PCT_IO(100), LSN_MAX, &n_flushed);
 
 			if (n_flushed) {
+
 				MONITOR_INC_VALUE_CUMULATIVE(
 					MONITOR_FLUSH_BACKGROUND_TOTAL_PAGE,
 					MONITOR_FLUSH_BACKGROUND_COUNT,
 					MONITOR_FLUSH_BACKGROUND_PAGES,
 					n_flushed);
+
 			}
+
 		} else {
 			/* no activity, but woken up by event */
 			n_flushed = 0;
@@ -2728,12 +2770,12 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 		if (n_flushed == 0) {
 			os_thread_sleep(100000);
 		}
-	} while (srv_shutdown_state == SRV_SHUTDOWN_CLEANUP);
+
+	} while (srv_get_active_thread_type() != SRV_NONE);
 
 	/* At this point all threads including the master and the purge
 	thread must have been suspended. */
-	ut_a(srv_get_active_thread_type() == SRV_NONE);
-	ut_a(srv_shutdown_state == SRV_SHUTDOWN_FLUSH_PHASE);
+	ut_a(srv_shutdown_state == SRV_SHUTDOWN_FLUSH_DONE);
 
 	/* We can now make a final sweep on flushing the buffer pool
 	and exit after we have cleaned the whole buffer pool.
@@ -2756,7 +2798,7 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 
 	/* Some sanity checks */
 	ut_a(srv_get_active_thread_type() == SRV_NONE);
-	ut_a(srv_shutdown_state == SRV_SHUTDOWN_FLUSH_PHASE);
+	ut_a(srv_shutdown_state == SRV_SHUTDOWN_FLUSH_DONE);
 
 	for (ulint i = 0; i < srv_buf_pool_instances; i++) {
 		buf_pool_t* buf_pool = buf_pool_from_array(i);
@@ -2794,9 +2836,11 @@ DECLARE_THREAD(buf_flush_page_cleaner_worker)(
 
 	while (true) {
 		os_event_wait(page_cleaner->is_requested);
-		if (srv_shutdown_state != SRV_SHUTDOWN_NONE) {
+
+		if (srv_shutdown_state >= SRV_SHUTDOWN_FLUSH_DONE) {
 			break;
 		}
+
 		pc_flush_slot();
 	}
 

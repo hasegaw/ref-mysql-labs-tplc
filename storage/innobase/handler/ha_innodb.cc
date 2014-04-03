@@ -1604,7 +1604,7 @@ innobase_convert_from_table_id(
 {
 	uint	errors;
 
-	strconvert(cs, from, &my_charset_filename, to, (uint) len, &errors);
+	strconvert(cs, from, &my_charset_filename, to, len, &errors);
 }
 
 /**********************************************************************
@@ -1645,7 +1645,7 @@ innobase_convert_from_id(
 {
 	uint	errors;
 
-	strconvert(cs, from, system_charset_info, to, (uint) len, &errors);
+	strconvert(cs, from, system_charset_info, to, len, &errors);
 }
 
 /******************************************************************//**
@@ -1722,21 +1722,39 @@ innobase_get_charset(
 	return(thd_charset(mysql_thd));
 }
 
-/**********************************************************************//**
-Determines the current SQL statement.
-@return SQL statement string */
-
+/** Determines the current SQL statement.
+Thread unsafe, can only be called from the thread owning the THD.
+@param[in]	thd	MySQL thread handle
+@param[out]	length	Length of the SQL statement
+@return			SQL statement string */
 const char*
-innobase_get_stmt(
+innobase_get_stmt_unsafe(
 /*==============*/
-	THD*	thd,		/*!< in: MySQL thread handle */
-	size_t*	length)		/*!< out: length of the SQL statement */
+	THD*	thd,
+	size_t*	length)
 {
 	LEX_CSTRING stmt;
 
-	stmt = thd_query_string(thd);
+	stmt = thd_query_unsafe(thd);
 	*length = stmt.length;
 	return(stmt.str);
+}
+
+/** Determines the current SQL statement.
+Thread safe, can be called from any thread as the string is copied
+into the provided buffer.
+@param[in]	thd	MySQL thread handle
+@param[out]	buf	Buffer containing SQL statement
+@param[in]	buflen	Length of provided buffer
+@return			Length of the SQL statement */
+size_t
+innobase_get_stmt_safe(
+/*==============*/
+	THD*	thd,
+	char*	buf,
+	size_t	buflen)
+{
+	return(thd_query_safe(thd, buf, buflen));
 }
 
 /**********************************************************************//**
@@ -2519,7 +2537,7 @@ innobase_convert_identifier(
 	if (UNIV_UNLIKELY(!thd)) {
 		q = '"';
 	} else {
-		q = get_quote_char_for_identifier(thd, s, (int) idlen);
+		q = get_quote_char_for_identifier(thd, s, idlen);
 	}
 
 	if (q == EOF) {
@@ -2863,7 +2881,7 @@ innobase_init(
 		}
 	}
 
-	os_innodb_umask = (ulint) my_umask;
+	os_file_set_umask(my_umask);
 
 	/* First calculate the default path for innodb_data_home_dir etc.,
 	in case the user has not given any value.
@@ -3035,7 +3053,7 @@ innobase_change_buffering_inited_ok:
 				  " cannot be set higher than"
 				  " innodb_max_dirty_pages_pct.\n"
 				  "InnoDB: Setting"
-				  " innodb_max_dirty_pages_pct_lwm to %lu\n",
+				  " innodb_max_dirty_pages_pct_lwm to %lf\n",
 				  srv_max_buf_pool_modified_pct);
 
 		srv_max_dirty_pages_pct_lwm = srv_max_buf_pool_modified_pct;
@@ -3179,7 +3197,7 @@ innobase_change_buffering_inited_ok:
 	int	count;
 
 	count = array_elements(all_pthread_mutexes);
- 	mysql_mutex_register("innodb", all_pthread_mutexes, count);
+	mysql_mutex_register("innodb", all_pthread_mutexes, count);
 
 # ifdef UNIV_PFS_MUTEX
 	count = array_elements(all_innodb_mutexes);
@@ -7291,12 +7309,8 @@ ha_innobase::index_read(
 	case DB_SUCCESS:
 		error = 0;
 		table->status = 0;
-		if (srv_stats.n_rows_read.is_fast()) {
-			srv_stats.n_rows_read.inc();
-		} else {
-			srv_stats.n_rows_read.add(
-				thd_get_thread_id(prebuilt->trx->mysql_thd), 1);
-		}
+		srv_stats.n_rows_read.add(
+			thd_get_thread_id(prebuilt->trx->mysql_thd), 1);
 		break;
 	case DB_RECORD_NOT_FOUND:
 		error = HA_ERR_KEY_NOT_FOUND;
@@ -7558,12 +7572,8 @@ ha_innobase::general_fetch(
 	case DB_SUCCESS:
 		error = 0;
 		table->status = 0;
-		if (srv_stats.n_rows_read.is_fast()) {
-			srv_stats.n_rows_read.inc();
-		} else {
-			srv_stats.n_rows_read.add(
-				thd_get_thread_id(prebuilt->trx->mysql_thd), 1);
-		}
+		srv_stats.n_rows_read.add(
+			thd_get_thread_id(prebuilt->trx->mysql_thd), 1);
 		break;
 	case DB_RECORD_NOT_FOUND:
 		error = HA_ERR_END_OF_FILE;
@@ -9499,7 +9509,7 @@ ha_innobase::create(
 		dict_table_get_all_fts_indexes(innobase_table, fts->indexes);
 	}
 
-	stmt = innobase_get_stmt(thd, &stmt_len);
+	stmt = innobase_get_stmt_unsafe(thd, &stmt_len);
 
 	if (stmt) {
 		dberr_t	err = row_table_add_foreign_constraints(
@@ -10581,8 +10591,6 @@ innobase_get_mysql_key_number_for_index(
 	const dict_index_t*	ind;
 	unsigned int		i;
 
- 	ut_a(index);
-
 	/* If index does not belong to the table object of share structure
 	(ib_table comes from the share structure) search the index->table
 	object instead */
@@ -11575,7 +11583,7 @@ get_foreign_key_info(
 	FOREIGN_KEY_INFO	f_key_info;
 	FOREIGN_KEY_INFO*	pf_key_info;
 	uint			i = 0;
-	ulint			len;
+	size_t			len;
 	char			tmp_buff[NAME_LEN+1];
 	char			name_buff[NAME_LEN+1];
 	const char*		ptr;
@@ -13127,7 +13135,7 @@ ha_innobase::get_foreign_dup_key(
 	} else {
 		p = err_index->table->name;
 	}
-	uint	len;
+	size_t	len;
 	len = filename_to_tablename(p, child_table_name, child_table_name_len);
 	child_table_name[len] = '\0';
 
@@ -13616,7 +13624,7 @@ innodb_max_dirty_pages_pct_update(
 	const void*			save)	/*!< in: immediate result
 						from check function */
 {
-	ulong	in_val = *static_cast<const ulong*>(save);
+	double	in_val = *static_cast<const double*>(save);
 	if (in_val < srv_max_dirty_pages_pct_lwm) {
 		push_warning_printf(thd, Sql_condition::SL_WARNING,
 				    ER_WRONG_ARGUMENTS,
@@ -13626,7 +13634,7 @@ innodb_max_dirty_pages_pct_update(
 		push_warning_printf(thd, Sql_condition::SL_WARNING,
 				    ER_WRONG_ARGUMENTS,
 				    "Lowering"
-				    " innodb_max_dirty_page_pct_lwm to %lu",
+				    " innodb_max_dirty_page_pct_lwm to %lf",
 				    in_val);
 
 		srv_max_dirty_pages_pct_lwm = in_val;
@@ -13650,7 +13658,7 @@ innodb_max_dirty_pages_pct_lwm_update(
 	const void*			save)	/*!< in: immediate result
 						from check function */
 {
-	ulong	in_val = *static_cast<const ulong*>(save);
+	double	in_val = *static_cast<const double*>(save);
 	if (in_val > srv_max_buf_pool_modified_pct) {
 		in_val = srv_max_buf_pool_modified_pct;
 		push_warning_printf(thd, Sql_condition::SL_WARNING,
@@ -13661,7 +13669,7 @@ innodb_max_dirty_pages_pct_lwm_update(
 		push_warning_printf(thd, Sql_condition::SL_WARNING,
 				    ER_WRONG_ARGUMENTS,
 				    "Setting innodb_max_dirty_page_pct_lwm"
-				    " to %lu",
+				    " to %lf",
 				    in_val);
 	}
 
@@ -14900,9 +14908,9 @@ innodb_enable_monitor_at_startup(
 	and/or counter group name, and calling innodb_monitor_update()
 	if successfully updated. Please note that the "str" would be
 	changed by strtok_r() as it walks through it. */
-	for (char* option = strtok_r(str, sep, &last);
+	for (char* option = my_strtok_r(str, sep, &last);
 	     option;
-	     option = strtok_r(NULL, sep, &last)) {
+	     option = my_strtok_r(NULL, sep, &last)) {
 		ulint	ret;
 		char*	option_name;
 
@@ -15570,16 +15578,16 @@ static MYSQL_SYSVAR_ULONG(page_cleaners, srv_n_page_cleaners,
   "Page cleaner threads can be from 1 to 64. Default is 1.",
   NULL, NULL, 1, 1, 64, 0);
 
-static MYSQL_SYSVAR_ULONG(max_dirty_pages_pct, srv_max_buf_pool_modified_pct,
+static MYSQL_SYSVAR_DOUBLE(max_dirty_pages_pct, srv_max_buf_pool_modified_pct,
   PLUGIN_VAR_RQCMDARG,
   "Percentage of dirty pages allowed in bufferpool.",
-  NULL, innodb_max_dirty_pages_pct_update, 75, 0, 99, 0);
+  NULL, innodb_max_dirty_pages_pct_update, 75.0, 0, 99.999, 0);
 
-static MYSQL_SYSVAR_ULONG(max_dirty_pages_pct_lwm,
+static MYSQL_SYSVAR_DOUBLE(max_dirty_pages_pct_lwm,
   srv_max_dirty_pages_pct_lwm,
   PLUGIN_VAR_RQCMDARG,
   "Percentage of dirty pages at which flushing kicks in.",
-  NULL, innodb_max_dirty_pages_pct_lwm_update, 0, 0, 99, 0);
+  NULL, innodb_max_dirty_pages_pct_lwm_update, 0, 0, 99.999, 0);
 
 static MYSQL_SYSVAR_ULONG(adaptive_flushing_lwm,
   srv_adaptive_flushing_lwm,
@@ -16187,6 +16195,31 @@ static MYSQL_SYSVAR_ULONG(saved_page_number_debug,
   NULL, innodb_save_page_no, 0, 0, UINT_MAX32, 0);
 #endif /* UNIV_DEBUG */
 
+static MYSQL_SYSVAR_ULONG(compression_algorithm, srv_compression_algorithm,
+  PLUGIN_VAR_RQCMDARG,
+  "0 for no compression, 1 for ZLib, 2 for LZ4. "
+  "Note: ZLib & LZ4 use the level from --innodb-compression-level",
+  NULL, NULL,
+  0,		/* Default value - No compression */
+  0,		/* Minimum value */
+  2, 0);	/* Maximum value */
+
+static MYSQL_SYSVAR_BOOL(compression_punch_hole, srv_punch_hole,
+  PLUGIN_VAR_RQCMDARG,
+  "Enable punch hole when PageIO compression is used (on by default)",
+  NULL, NULL, TRUE);
+
+static MYSQL_SYSVAR_BOOL(read_async, srv_read_async,
+  PLUGIN_VAR_RQCMDARG,
+  "Always do an ASYNC read from the buffer pool - defauly is OFF",
+  NULL, NULL, FALSE);
+
+static MYSQL_SYSVAR_BOOL(read_block_size, srv_read_block_size,
+  PLUGIN_VAR_RQCMDARG,
+  "Try and read only as much as required in file system block size units,"
+  " instead of in InnoDB page size units",
+  NULL, NULL, FALSE);
+
 static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(api_trx_level),
   MYSQL_SYSVAR(api_bk_commit_interval),
@@ -16339,6 +16372,10 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(fil_make_page_dirty_debug),
   MYSQL_SYSVAR(saved_page_number_debug),
 #endif /* UNIV_DEBUG */
+  MYSQL_SYSVAR(compression_algorithm),
+  MYSQL_SYSVAR(compression_punch_hole),
+  MYSQL_SYSVAR(read_async),
+  MYSQL_SYSVAR(read_block_size),
   NULL
 };
 
@@ -16791,7 +16828,7 @@ innobase_convert_to_filename_charset(
 	CHARSET_INFO*	cs_from = system_charset_info;
 
 	return(strconvert(
-		cs_from, from, cs_to, to, static_cast<uint>(len), &errors));
+		cs_from, from, cs_to, to, len, &errors));
 }
 
 /**********************************************************************
@@ -16809,5 +16846,5 @@ innobase_convert_to_system_charset(
 	CHARSET_INFO*	cs2 = system_charset_info;
 
 	return(strconvert(
-		cs1, from, cs2, to, static_cast<uint>(len), errors));
+		cs1, from, cs2, to, len, errors));
 }

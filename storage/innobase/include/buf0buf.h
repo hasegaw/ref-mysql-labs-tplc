@@ -882,7 +882,7 @@ Returns the ratio in percents of modified pages in the buffer pool /
 database pages in the buffer pool.
 @return modified page percentage ratio */
 
-ulint
+double
 buf_get_modified_ratio_pct(void);
 /*============================*/
 /**********************************************************************//**
@@ -1448,6 +1448,12 @@ buf_flush_update_zip_checksum(
 	buf_frame_t*	page,
 	ulint		size,
 	lsn_t		lsn);
+
+/**
+@return true if we should do a sync IO */
+
+bool
+buf_get_aio_sync_flag(const buf_page_t* bpage);
 
 #endif /* !UNIV_HOTBACKUP */
 

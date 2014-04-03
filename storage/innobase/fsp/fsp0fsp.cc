@@ -784,7 +784,8 @@ fsp_header_get_space_id(
 
 	if (id != fsp_id) {
 		ib_logf(IB_LOG_LEVEL_ERROR,
-			"Space id in fsp header %lu,but in the page header %lu",
+			"Space id in fsp header %lu, but in the page"
+			" header %lu",
 			fsp_id, id);
 
 		return(ULINT_UNDEFINED);

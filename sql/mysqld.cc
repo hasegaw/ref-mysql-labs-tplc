@@ -108,7 +108,6 @@
 #include <ft_global.h>
 #include <errmsg.h>
 #include "sp_rcontext.h"
-#include "sp_cache.h"
 #include "sql_reload.h"  // reload_acl_and_cache
 #include "sp_head.h"  // init_sp_psi_keys
 #include "event_data_objects.h" //init_scheduler_psi_keys
@@ -495,14 +494,11 @@ ulong binlog_cache_size=0;
 ulonglong  max_binlog_cache_size=0;
 ulong slave_max_allowed_packet= 0;
 ulong binlog_stmt_cache_size=0;
-my_atomic_rwlock_t opt_binlog_max_flush_queue_time_lock;
 int32 opt_binlog_max_flush_queue_time= 0;
 ulonglong  max_binlog_stmt_cache_size=0;
 ulong query_cache_size=0;
 ulong refresh_version;  /* Increments on each reload */
 query_id_t global_query_id;
-my_atomic_rwlock_t global_query_id_lock;
-my_atomic_rwlock_t slave_open_temp_tables_lock;
 ulong aborted_threads;
 ulong delayed_insert_timeout, delayed_insert_limit, delayed_queue_size;
 ulong delayed_insert_threads, delayed_insert_writes, delayed_rows_in_use;
@@ -598,7 +594,7 @@ char mysql_real_data_home[FN_REFLEN],
      *opt_init_file, *opt_tc_log_file;
 char *lc_messages_dir_ptr, *log_error_file_ptr;
 char mysql_unpacked_real_data_home[FN_REFLEN];
-int mysql_unpacked_real_data_home_len;
+size_t mysql_unpacked_real_data_home_len;
 uint mysql_real_data_home_len, mysql_data_home_len= 1;
 uint reg_ext_length;
 const key_map key_map_empty(0);
@@ -1358,6 +1354,18 @@ static void mysqld_exit(int exit_code)
 #ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
   shutdown_performance_schema();
 #endif
+#if defined(_WIN32)
+  if (Service.IsNT() && start_mode)
+  {
+    Service.Stop();
+  }
+  else
+  {
+    Service.SetShutdownEvent(0);
+    if (hEventShutdown)
+      CloseHandle(hEventShutdown);
+  }
+#endif
   exit(exit_code); /* purecov: inspected */
 }
 
@@ -1494,8 +1502,6 @@ void clean_up(bool print_message)
   (void) my_error_unregister(ER_ERROR_FIRST, ER_ERROR_LAST); // finish server errs
   DBUG_PRINT("quit", ("Error messages freed"));
 
-  my_atomic_rwlock_destroy(&opt_binlog_max_flush_queue_time_lock);
-  my_atomic_rwlock_destroy(&global_query_id_lock);
   free_charsets();
   sys_var_end();
   Global_THD_manager::destroy_instance();
@@ -2514,8 +2520,7 @@ SHOW_VAR com_status_vars[]= {
   {"drop_view",            (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_DROP_VIEW]), SHOW_LONG_STATUS},
   {"empty_query",          (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_EMPTY_QUERY]), SHOW_LONG_STATUS},
   {"execute_sql",          (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_EXECUTE]), SHOW_LONG_STATUS},
-  {"explain_other",        (char*) offsetof(STATUS_VAR, com_stat[(uint)
-  SQLCOM_EXPLAIN_OTHER]), SHOW_LONG_STATUS},
+  {"explain_other",        (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_EXPLAIN_OTHER]), SHOW_LONG_STATUS},
   {"flush",                (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_FLUSH]), SHOW_LONG_STATUS},
   {"get_diagnostics",      (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_GET_DIAGNOSTICS]), SHOW_LONG_STATUS},
   {"grant",                (char*) offsetof(STATUS_VAR, com_stat[(uint) SQLCOM_GRANT]), SHOW_LONG_STATUS},
@@ -3274,7 +3279,6 @@ static int init_thread_environment()
   mysql_mutex_init(key_LOCK_server_started,
                    &LOCK_server_started, MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_server_started, &COND_server_started, NULL);
-  sp_cache_init();
 #ifndef EMBEDDED_LIBRARY
   Events::init_mutexes();
 #if defined(_WIN32)
@@ -3552,6 +3556,17 @@ static int init_server_auto_options()
   /* load_defaults require argv[0] is not null */
   char **argv= &name;
   int argc= 1;
+  if (!check_file_permissions(fname))
+  {
+    /*
+      Found a world writable file hence removing it as it is dangerous to write
+      a new UUID into the same file.
+     */
+    my_delete(fname,MYF(MY_WME));
+    sql_print_warning("World-writable config file '%s' has been removed.\n",
+                      fname);
+  }
+
   /* load all options in 'auto.cnf'. */
   if (my_load_defaults(fname, groups, &argc, &argv, NULL))
     DBUG_RETURN(1);
@@ -4750,16 +4765,6 @@ int mysqld_main(int argc, char **argv)
     sql_print_warning("Could not join signal_thread. error:%d", ret);
 #endif
 
-#if defined(_WIN32)
-  if (Service.IsNT() && start_mode)
-    Service.Stop();
-  else
-  {
-    Service.SetShutdownEvent(0);
-    if (hEventShutdown)
-      CloseHandle(hEventShutdown);
-  }
-#endif
   clean_up(1);
   mysqld_exit(0);
 }
@@ -5102,17 +5107,17 @@ void adjust_open_files_limit(ulong *requested_open_files)
 
     if (open_files_limit == 0)
     {
-      snprintf(msg, sizeof(msg),
-               "Changed limits: max_open_files: %lu (requested %lu)",
-               effective_open_files, request_open_files);
+      my_snprintf(msg, sizeof(msg),
+                  "Changed limits: max_open_files: %lu (requested %lu)",
+                  effective_open_files, request_open_files);
       buffered_logs.buffer(WARNING_LEVEL, msg);
     }
     else
     {
-      snprintf(msg, sizeof(msg),
-               "Could not increase number of max_open_files to "
-               "more than %lu (request: %lu)",
-               effective_open_files, request_open_files);
+      my_snprintf(msg, sizeof(msg),
+                  "Could not increase number of max_open_files to "
+                  "more than %lu (request: %lu)",
+                  effective_open_files, request_open_files);
       buffered_logs.buffer(WARNING_LEVEL, msg);
     }
   }
@@ -5132,9 +5137,9 @@ void adjust_max_connections(ulong requested_open_files)
   {
     char msg[1024];
 
-    snprintf(msg, sizeof(msg),
-             "Changed limits: max_connections: %lu (requested %lu)",
-             limit, max_connections);
+    my_snprintf(msg, sizeof(msg),
+                "Changed limits: max_connections: %lu (requested %lu)",
+                limit, max_connections);
     buffered_logs.buffer(WARNING_LEVEL, msg);
 
     // This can be done unprotected since it is only called on startup.
@@ -5153,9 +5158,9 @@ void adjust_table_cache_size(ulong requested_open_files)
   {
     char msg[1024];
 
-    snprintf(msg, sizeof(msg),
-             "Changed limits: table_cache: %lu (requested %lu)",
-             limit, table_cache_size);
+    my_snprintf(msg, sizeof(msg),
+                "Changed limits: table_cache: %lu (requested %lu)",
+                limit, table_cache_size);
     buffered_logs.buffer(WARNING_LEVEL, msg);
 
     table_cache_size= limit;
@@ -5587,6 +5592,17 @@ static int show_starttime(THD *thd, SHOW_VAR *var, char *buff)
   var->type= SHOW_LONGLONG;
   var->value= buff;
   *((longlong *)buff)= (longlong) (thd->query_start() - server_start_time);
+  return 0;
+}
+
+static int show_max_used_connections_time(THD *thd, SHOW_VAR *var, char *buff)
+{
+  MYSQL_TIME max_used_connections_time;
+  var->type= SHOW_CHAR;
+  var->value= buff;
+  thd->variables.time_zone->gmt_sec_to_TIME(&max_used_connections_time,
+    Connection_handler_manager::max_used_connections_time);
+  my_datetime_to_str(&max_used_connections_time, buff, 0);
   return 0;
 }
 
@@ -6191,8 +6207,7 @@ SHOW_VAR status_vars[]= {
 #ifndef EMBEDDED_LIBRARY
   {"Connection_errors_accept",   (char*) &show_connection_errors_accept, SHOW_FUNC},
   {"Connection_errors_internal", (char*) &connection_errors_internal, SHOW_LONG},
-  {"Connection_errors_max_connections",
-   (char*) &show_connection_errors_max_connection, SHOW_FUNC},
+  {"Connection_errors_max_connections", (char*) &show_connection_errors_max_connection, SHOW_FUNC},
   {"Connection_errors_peer_address", (char*) &connection_errors_peer_addr, SHOW_LONG},
   {"Connection_errors_select",   (char*) &show_connection_errors_select, SHOW_FUNC},
   {"Connection_errors_tcpwrap",  (char*) &show_connection_errors_tcpwrap, SHOW_FUNC},
@@ -6231,10 +6246,11 @@ SHOW_VAR status_vars[]= {
   {"Key_writes",               (char*) offsetof(KEY_CACHE, global_cache_write), SHOW_KEY_CACHE_LONGLONG},
   {"Last_query_cost",          (char*) offsetof(STATUS_VAR, last_query_cost), SHOW_DOUBLE_STATUS},
   {"Last_query_partial_plans", (char*) offsetof(STATUS_VAR, last_query_partial_plans), SHOW_LONGLONG_STATUS},
-  {"Max_used_connections",     (char*) &Connection_handler_manager::max_used_connections, SHOW_LONG},
   {"Max_statement_time_exceeded",   (char*) offsetof(STATUS_VAR, max_statement_time_exceeded), SHOW_LONG_STATUS},
   {"Max_statement_time_set",        (char*) offsetof(STATUS_VAR, max_statement_time_set), SHOW_LONG_STATUS},
   {"Max_statement_time_set_failed", (char*) offsetof(STATUS_VAR, max_statement_time_set_failed), SHOW_LONG_STATUS},
+  {"Max_used_connections",     (char*) &Connection_handler_manager::max_used_connections, SHOW_LONG},
+  {"Max_used_connections_time",(char*) &show_max_used_connections_time, SHOW_FUNC},
   {"Not_flushed_delayed_rows", (char*) &delayed_rows_in_use,    SHOW_LONG_NOFLUSH},
   {"Open_files",               (char*) &my_file_opened,         SHOW_LONG_NOFLUSH},
   {"Open_streams",             (char*) &my_stream_opened,       SHOW_LONG_NOFLUSH},
@@ -6303,10 +6319,8 @@ SHOW_VAR status_vars[]= {
   {"Ssl_verify_depth",         (char*) &show_ssl_get_verify_depth, SHOW_FUNC},
   {"Ssl_verify_mode",          (char*) &show_ssl_get_verify_mode, SHOW_FUNC},
   {"Ssl_version",              (char*) &show_ssl_get_version, SHOW_FUNC},
-  {"Ssl_server_not_before",    (char*) &show_ssl_get_server_not_before,
-    SHOW_FUNC},
-  {"Ssl_server_not_after",     (char*) &show_ssl_get_server_not_after,
-    SHOW_FUNC},
+  {"Ssl_server_not_before",    (char*) &show_ssl_get_server_not_before, SHOW_FUNC},
+  {"Ssl_server_not_after",     (char*) &show_ssl_get_server_not_after, SHOW_FUNC},
 #ifndef HAVE_YASSL
   {"Rsa_public_key",           (char*) &show_rsa_public_key, SHOW_FUNC},
 #endif
@@ -6323,11 +6337,9 @@ SHOW_VAR status_vars[]= {
   {"Tc_log_page_waits",        (char*) &tc_log_page_waits,      SHOW_LONG},
 #endif
 #ifndef EMBEDDED_LIBRARY
-  {"Threads_cached",           (char*) &Per_thread_connection_handler::blocked_pthread_count,
-   SHOW_LONG_NOFLUSH},
+  {"Threads_cached",           (char*) &Per_thread_connection_handler::blocked_pthread_count, SHOW_LONG_NOFLUSH},
 #endif
-  {"Threads_connected",        (char*) &Connection_handler_manager::connection_count,
-   SHOW_INT},
+  {"Threads_connected",        (char*) &Connection_handler_manager::connection_count, SHOW_INT},
   {"Threads_created",          (char*) &show_num_thread_created,   SHOW_FUNC},
   {"Threads_running",          (char*) &show_num_thread_running,   SHOW_FUNC},
   {"Uptime",                   (char*) &show_starttime,         SHOW_FUNC},
@@ -6528,8 +6540,6 @@ static int mysql_init_variables(void)
   what_to_log= ~ (1L << (uint) COM_TIME);
   refresh_version= 1L;  /* Increments on each reload */
   global_query_id= 1L;
-  my_atomic_rwlock_init(&opt_binlog_max_flush_queue_time_lock);
-  my_atomic_rwlock_init(&global_query_id_lock);
   my_stpcpy(server_version, MYSQL_SERVER_VERSION);
   key_caches.empty();
   if (!(dflt_key_cache= get_or_create_key_cache(default_key_cache_base.str,
@@ -7446,7 +7456,7 @@ static int fix_paths(void)
 
   my_realpath(mysql_unpacked_real_data_home, mysql_real_data_home, MYF(0));
   mysql_unpacked_real_data_home_len=
-    (int) strlen(mysql_unpacked_real_data_home);
+    strlen(mysql_unpacked_real_data_home);
   if (mysql_unpacked_real_data_home[mysql_unpacked_real_data_home_len-1] == FN_LIBCHAR)
     --mysql_unpacked_real_data_home_len;
 
@@ -7676,7 +7686,7 @@ PSI_mutex_key
   key_mutex_slave_parallel_worker,
   key_structure_guard_mutex, key_TABLE_SHARE_LOCK_ha_data,
   key_LOCK_error_messages,
-  key_LOCK_log_throttle_qni, key_LOCK_query_plan;
+  key_LOCK_log_throttle_qni, key_LOCK_query_plan, key_LOCK_thd_query;
 PSI_mutex_key key_RELAYLOG_LOCK_commit;
 PSI_mutex_key key_RELAYLOG_LOCK_commit_queue;
 PSI_mutex_key key_RELAYLOG_LOCK_done;
@@ -7744,6 +7754,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_system_variables_hash, "LOCK_system_variables_hash", PSI_FLAG_GLOBAL},
   { &key_LOCK_table_share, "LOCK_table_share", PSI_FLAG_GLOBAL},
   { &key_LOCK_thd_data, "THD::LOCK_thd_data", 0},
+  { &key_LOCK_thd_query, "THD::LOCK_thd_query", 0},
   { &key_LOCK_user_conn, "LOCK_user_conn", PSI_FLAG_GLOBAL},
   { &key_LOCK_uuid_generator, "LOCK_uuid_generator", PSI_FLAG_GLOBAL},
   { &key_LOCK_sql_rand, "LOCK_sql_rand", PSI_FLAG_GLOBAL},

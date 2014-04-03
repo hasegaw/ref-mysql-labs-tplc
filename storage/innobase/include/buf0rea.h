@@ -161,9 +161,6 @@ invoked */
 #define BUF_READ_IBUF_PAGES_ONLY	131
 /** read any page */
 #define BUF_READ_ANY_PAGE		132
-/** read any page, but ignore (return an error) if a page does not exist
-instead of crashing like BUF_READ_ANY_PAGE does */
-#define BUF_READ_IGNORE_NONEXISTENT_PAGES 1024
 /* @} */
 
 #endif

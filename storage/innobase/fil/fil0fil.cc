@@ -170,6 +170,15 @@ struct fil_node_t {
 	UT_LIST_NODE_T(fil_node_t) LRU;
 				/*!< link field for the LRU list */
 	ulint		magic_n;/*!< FIL_NODE_MAGIC_N */
+
+	/** true if the FS where the file is located supports PUNCH HOLE */
+	bool		punch_hole;
+
+	/** Block size to use for punching holes */
+	ulint           block_size;
+
+	/** True if atomic write is enabled for this file */
+	bool		atomic_write;
 };
 
 /** Value of fil_node_t::magic_n */
@@ -314,11 +323,6 @@ static ulint	srv_data_read;
 static ulint	srv_data_written;
 #endif /* UNIV_HOTBACKUP */
 
-/** Determine if (i) is a user tablespace id or not. */
-# define fil_is_user_tablespace_id(i)		\
-	(((i) > srv_undo_tablespaces_open)	\
-	 && ((i) != srv_tmp_space.space_id()))
-
 /** Determine if user has explicitly disabled fsync(). */
 #ifndef _WIN32
 # define fil_buffering_disabled(s)	\
@@ -394,18 +398,20 @@ fil_node_prepare_for_io(
 	fil_node_t*	node,	/*!< in: file node */
 	fil_system_t*	system,	/*!< in: tablespace memory cache */
 	fil_space_t*	space);	/*!< in: space */
-/********************************************************************//**
+
+/**
 Updates the data structures when an i/o operation finishes. Updates the
-pending i/o's field in the node appropriately. */
+pending i/o's field in the node appropriately.
+@param[in,out] node		file node
+@param[in,out] system		tablespace instance
+@param[in] type			IO context */
 static
 void
 fil_node_complete_io(
-/*=================*/
-	fil_node_t*	node,	/*!< in: file node */
-	fil_system_t*	system,	/*!< in: tablespace memory cache */
-	ulint		type);	/*!< in: OS_FILE_WRITE or OS_FILE_READ; marks
-				the node as modified if
-				type == OS_FILE_WRITE */
+	fil_node_t*	node,
+	fil_system_t*	system,
+	const IORequest&type);
+
 /*******************************************************************//**
 Frees a space object from the tablespace memory cache. Closes the files in
 the chain but does not delete them. There must not be any pending i/o's or
@@ -441,7 +447,15 @@ fil_read(
 	ulint			len,
 	void*			buf)
 {
-	return(fil_io(OS_FILE_READ, true, page_id, page_size,
+	ulint	type = IORequest::READ;
+
+	if (!page_size.is_compressed() && page_id.page_no() > 0) {
+	       	type |= IORequest::COMPRESS;
+	}
+
+	IORequest	request(type);
+
+	return(fil_io(request, true, page_id, page_size,
 		      byte_offset, len, buf, NULL));
 }
 
@@ -469,7 +483,15 @@ fil_write(
 {
 	ut_ad(!srv_read_only_mode);
 
-	return(fil_io(OS_FILE_WRITE, true, page_id, page_size,
+	ulint	type = IORequest::WRITE;
+
+	if (!page_size.is_compressed() && page_id.page_no() > 0) {
+	       	type |= IORequest::COMPRESS;
+	}
+
+	IORequest	request(type);
+
+	return(fil_io(request, true, page_id, page_size,
 		      byte_offset, len, buf, NULL));
 }
 
@@ -597,7 +619,7 @@ fil_space_get_type(
 }
 
 /** @brief Note that a tablespace has been imported.
-It is initially marked as FIL_TYPE_TEMPORARY so that no logging is
+It is initially marked as FIL_TYPE_IMPORT so that no logging is
 done during the import process when the space ID is stamped to each page.
 Now we change it to FIL_SPACE_TABLESPACE to start redo and undo logging.
 NOTE: temporary tablespaces are never imported.
@@ -616,7 +638,7 @@ fil_space_set_imported(
 	space = fil_space_get_by_id(id);
 
 	ut_a(space);
-	ut_ad(space->purpose == FIL_TYPE_TEMPORARY);
+	ut_ad(space->purpose == FIL_TYPE_IMPORT);
 	space->purpose = FIL_TYPE_TABLESPACE;
 
 	mutex_exit(&fil_system->mutex);
@@ -633,20 +655,17 @@ fil_space_is_flushed(
 /*=================*/
 	fil_space_t*	space)	/*!< in: space */
 {
-	fil_node_t*	node;
-
 	ut_ad(mutex_own(&fil_system->mutex));
 
-	node = UT_LIST_GET_FIRST(space->chain);
+	for (const fil_node_t* node = UT_LIST_GET_FIRST(space->chain);
+	     node != NULL;
+	     node = UT_LIST_GET_NEXT(chain, node)) {
 
-	while (node) {
 		if (node->modification_counter > node->flush_counter) {
 
 			ut_ad(!fil_buffering_disabled(space));
 			return(false);
 		}
-
-		node = UT_LIST_GET_NEXT(chain, node);
 	}
 
 	return(true);
@@ -682,19 +701,27 @@ fil_fusionio_enable_atomic_write(os_file_t file)
 }
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
 
-/*******************************************************************//**
-Appends a new file to the chain of files of a space. File must be closed.
-@return pointer to the file name, or NULL on error */
 
-char*
-fil_node_create(
-/*============*/
-	const char*	name,	/*!< in: file name (file must be closed) */
-	ulint		size,	/*!< in: file size in database blocks, rounded
-				downwards to an integer */
-	fil_space_t*	space,	/*!< in,out: space where to append */
-	bool		is_raw)	/*!< in: true if a raw device or
-				a raw disk partition */
+/**
+Appends a new file to the chain of files of a space. File must be closed.
+@param[in] name		file name (file must be closed)
+@param[in] size		file size in database blocks, rounded downwards to
+			an integer
+@param[in,out] space	space where to append
+@param[in] is_raw	true if a raw device or a raw disk partition
+@param[in] punch_hole	true if the file system where the node is located
+			supports sparse files and "punch hole"
+@param[in] atomic_write	true if the file has atomic write enabled
+@return pointer to the file name, or NULL on error */
+static
+fil_node_t*
+fil_node_create_low(
+	const char*	name,
+	ulint		size,
+	fil_space_t*	space,
+	bool		is_raw,
+	bool		punch_hole,
+	bool		atomic_write)
 {
 	fil_node_t*	node;
 
@@ -705,7 +732,7 @@ fil_node_create(
 		return(NULL);
 	}
 
-	node = static_cast<fil_node_t*>(ut_zalloc(sizeof(fil_node_t)));
+	node = reinterpret_cast<fil_node_t*>(ut_zalloc(sizeof(*node)));
 
 	node->name = mem_strdup(name);
 
@@ -720,9 +747,51 @@ fil_node_create(
 
 	node->space = space;
 
+	os_file_stat_t	stat_info;
+
+#ifdef UNIV_DEBUG
+	dberr_t err =
+#endif /* UNIV_DEBUG */
+	os_file_get_status(node->name, &stat_info, false);
+
+	ut_ad(err == DB_SUCCESS);
+
+	node->block_size = stat_info.block_size;
+
+	node->punch_hole = IORequest::have_punch_hole() ? punch_hole : false;
+
+	node->atomic_write = atomic_write;
+
 	UT_LIST_ADD_LAST(space->chain, node);
 
-	return(node->name);
+	return(node);
+}
+
+/**
+Appends a new file to the chain of files of a space. File must be closed.
+@param[in] name		file name (file must be closed)
+@param[in] size		file size in database blocks, rounded downwards to
+			an integer
+@param[in,out] space	space where to append
+@param[in] is_raw	true if a raw device or a raw disk partition
+@param[in] atomic_write	true if the file has atomic write enabled
+@return pointer to the file name, or NULL on error */
+
+char*
+fil_node_create(
+	const char*	name,
+	ulint		size,
+	fil_space_t*	space,
+	bool		is_raw,
+	bool		atomic_write)
+{
+	fil_node_t*	node;
+
+	node = fil_node_create_low(
+		name, size, space, is_raw, IORequest::have_punch_hole(),
+		atomic_write);
+
+	return(node == NULL ? NULL : node->name);
 }
 
 /********************************************************************//**
@@ -761,6 +830,7 @@ fil_node_open_file(
 		node->handle = os_file_create_simple_no_error_handling(
 			innodb_data_file_key, node->name, OS_FILE_OPEN,
 			OS_FILE_READ_ONLY, &success);
+
 		if (!success) {
 			/* The following call prints an error message */
 			os_file_get_last_error(true);
@@ -775,6 +845,7 @@ fil_node_open_file(
 
 		size_bytes = os_file_get_size(node->handle);
 		ut_a(size_bytes != (os_offset_t) -1);
+
 #ifdef UNIV_HOTBACKUP
 		if (space->id == 0) {
 			node->size = (ulint) (size_bytes / UNIV_PAGE_SIZE);
@@ -788,11 +859,17 @@ fil_node_open_file(
 		/* Read the first page of the tablespace */
 
 		buf2 = static_cast<byte*>(ut_malloc(2 * UNIV_PAGE_SIZE));
+
 		/* Align the memory for file i/o if we might have O_DIRECT
 		set */
 		page = static_cast<byte*>(ut_align(buf2, UNIV_PAGE_SIZE));
 
-		success = os_file_read(node->handle, page, 0, UNIV_PAGE_SIZE);
+		IORequest	request(IORequest::READ | IORequest::COMPRESS);
+
+		success = os_file_read(
+			request,
+			node->handle, page, 0, UNIV_PAGE_SIZE);
+
 		space_id = fsp_header_get_space_id(page);
 		flags = fsp_header_get_flags(page);
 
@@ -809,21 +886,21 @@ fil_node_open_file(
 		if (size_bytes < min_size) {
 			ib_logf(IB_LOG_LEVEL_ERROR,
 				"The size of single-table tablespace file %s,"
-				" is only " UINT64PF ", should be at least %lu!",
+				" is only " UINT64PF ", should be at"
+				" least %lu!",
 				node->name, size_bytes, min_size);
 
 			ut_error;
 		}
 
-		if (UNIV_UNLIKELY(space_id != space->id)) {
+		if (space_id != space->id) {
 			ib_logf(IB_LOG_LEVEL_FATAL,
 				"Tablespace id is %lu in the data"
 				" dictionary but in file %s it is %lu!",
 				space->id, node->name, space_id);
 		}
 
-		if (UNIV_UNLIKELY(space_id == ULINT_UNDEFINED
-				  || space_id == 0)) {
+		if (space_id == ULINT_UNDEFINED || space_id == 0) {
 			ib_logf(IB_LOG_LEVEL_FATAL,
 				"Tablespace id %lu in file %s is not sensible",
 				(ulong) space_id, node->name);
@@ -848,7 +925,7 @@ fil_node_open_file(
 				space->flags);
 		}
 
-		if (UNIV_UNLIKELY(space->flags != flags)) {
+		if (space->flags != flags) {
 			ib_logf(IB_LOG_LEVEL_FATAL,
 				"Table flags are 0x%lx in the"
 				" data dictionary but the flags in file"
@@ -1486,7 +1563,8 @@ fil_space_get_space(
 			because the ibd file is missing. */
 			return(NULL);
 		}
-		fil_node_complete_io(node, fil_system, OS_FILE_READ);
+
+		fil_node_complete_io(node, fil_system, IORequestRead);
 	}
 
 	return(space);
@@ -3194,7 +3272,8 @@ fil_make_filepath(
 	length as the suffix from the end, then we will assume that there is
 	a previous suffix that needs to be replaced. */
 	if (suffix != NULL) {
-		ut_ad(len < full_len);  /* Need room for the trailing null byte. */
+		/* Need room for the trailing null byte. */
+		ut_ad(len < full_len);
 
 		if ((len > suffix_len)
 		   && (full_name[len - suffix_len] == suffix[0])) {
@@ -3497,11 +3576,13 @@ fil_create_new_single_table_tablespace(
 		return(DB_ERROR);
 	}
 
+	bool	atomic_write;
+
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 	if (fil_fusionio_enable_atomic_write(file)) {
 
 		/* This is required by FusionIO HW/Firmware */
-		if (posix_fallocate(file, 0, size * UNIV_PAGE_SIZE) == -1) {
+		if (posix_fallocate(file, 0, size * UNIV_PAGE_SIZE) != 0) {
 
 			ib_logf(IB_LOG_LEVEL_ERROR,
 				"posix_fallocate(): Failed to preallocate"
@@ -3519,11 +3600,16 @@ fil_create_new_single_table_tablespace(
 		} else {
 			success = true;
 		}
+
+		atomic_write = true;
 	} else {
+		atomic_write = false;
 
 		success = os_file_set_size(path, file, size * UNIV_PAGE_SIZE);
 	}
 #else
+	atomic_write = false;
+
 	success = os_file_set_size(path, file, size * UNIV_PAGE_SIZE);
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
 
@@ -3533,6 +3619,17 @@ fil_create_new_single_table_tablespace(
 		ut_free(path);
 		return(DB_OUT_OF_FILE_SPACE);
 	}
+
+	bool	punch_hole;
+
+	err = os_file_punch_hole(
+		file, size * UNIV_PAGE_SIZE, UNIV_SECTOR_SIZE, 0, 0);
+
+	punch_hole = (err == DB_SUCCESS);
+
+	/* Ignore the punch hole error, we wont be using punch hole
+	for this file from now on. */
+	err = DB_SUCCESS;
 
 	/* printf("Creating tablespace %s id %lu\n", path, space_id); */
 
@@ -3558,11 +3655,17 @@ fil_create_new_single_table_tablespace(
 	mach_write_to_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, space_id);
 
 	const page_size_t	page_size(flags);
+	IORequest		request(IORequest::WRITE);
 
 	if (!page_size.is_compressed()) {
+
 		buf_flush_init_for_writing(page, NULL, 0);
-		success = os_file_write(path, file, page, 0,
-					page_size.physical());
+
+		err = os_file_write(
+			request, path, file, page, 0, page_size.physical());
+
+		ut_ad(err != DB_IO_NO_PUNCH_HOLE);
+
 	} else {
 		page_zip_des_t	page_zip;
 
@@ -3573,21 +3676,28 @@ fil_create_new_single_table_tablespace(
 #endif /* UNIV_DEBUG */
 			page_zip.m_end = page_zip.m_nonempty =
 			page_zip.n_blobs = 0;
+
 		buf_flush_init_for_writing(page, &page_zip, 0);
-		success = os_file_write(path, file, page_zip.data, 0,
-					page_size.physical());
+
+		err = os_file_write(
+			request, path, file, page_zip.data, 0,
+			page_size.physical());
+
+		ut_a(err != DB_IO_NO_PUNCH_HOLE);
+
+		punch_hole = false;
 	}
 
 	::ut_free(buf2);
 
-	if (!success) {
+	if (err != DB_SUCCESS) {
 		ib_logf(IB_LOG_LEVEL_ERROR,
 			"Could not write the first page to tablespace '%s'",
 			path);
 		os_file_close(file);
 		os_file_delete(innodb_data_file_key, path);
 		ut_free(path);
-		return(DB_ERROR);
+		return(err);
 	}
 
 	success = os_file_flush(file);
@@ -3615,7 +3725,9 @@ fil_create_new_single_table_tablespace(
 	space = fil_space_create(tablename, space_id, flags, is_temp
 				 ? FIL_TYPE_TEMPORARY : FIL_TYPE_TABLESPACE);
 
-	if (!fil_node_create(path, size, space, false)) {
+	if (!fil_node_create_low(
+			path, size, space, false, punch_hole, atomic_write)) {
+
 		err = DB_ERROR;
 		goto error_exit_1;
 	}
@@ -3784,11 +3896,17 @@ fil_open_single_table_tablespace(
 		tablespaces_found++;
 	}
 
+	bool	atomic_write;
+
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 	if (!srv_use_doublewrite_buf) {
-		fil_fusionio_enable_atomic_write(df_default.handle());
-
+		atomic_write = fil_fusionio_enable_atomic_write(
+			df_default.handle());
+	} else {
+		atomic_write = false;
 	}
+#else
+	atomic_write = false;
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
 
 	/*  We have now checked all possible tablespace locations and
@@ -3957,10 +4075,12 @@ skip_validate:
 		/* We do not measure the size of the file, that is why
 		we pass the 0 below */
 
-		if (!fil_node_create(
+		if (fil_node_create_low(
 			    df_remote.is_open() ? df_remote.filepath() :
 			    df_dict.is_open() ? df_dict.filepath() :
-			    df_default.filepath(), 0, space, false)) {
+			    df_default.filepath(), 0, space, false,
+			    true, atomic_write) == NULL) {
+
 			err = DB_ERROR;
 		}
 	}
@@ -4280,7 +4400,9 @@ will_not_choose:
 	the rounding formula for extents and pages is somewhat complex; we
 	let fil_node_open() do that task. */
 
-	if (!fil_node_create(df->filepath(), 0, space, false)) {
+	if (!fil_node_create_low(
+		df->filepath(), 0, space, false, true, false)) {
+
 		ut_a(space != NULL);
 		ut_error;
 	}
@@ -4707,7 +4829,65 @@ fil_get_space_id_for_table(
 	return(id);
 }
 
-/**********************************************************************//**
+/**
+File the pages with NULs
+@param[in] node		File node
+@param[in] page_size	physical page size
+@param[in] start	Offset from the start of the file in bytes
+@param[in] len		Length in bytes
+@return DB_SUCCESS or error code */
+static
+dberr_t
+fil_write_zeros(
+	const fil_node_t*	node,
+	const ulint		page_size,
+	const os_offset_t	start,
+	const ulint		len)
+{
+	ut_a(len > 0);
+
+	ulint		n_bytes = ut_min(1024 * 1024, len);
+
+	/* Extend at most 1M at a time */
+
+	byte*	ptr = reinterpret_cast<byte*>(ut_zalloc(n_bytes + page_size));
+	byte*	buf = reinterpret_cast<byte*>(ut_align(ptr, page_size));
+
+	dberr_t			err;
+	os_offset_t		offset = start;
+	const os_offset_t	end = start + len;
+	IORequest		request(IORequest::WRITE);
+
+	while (offset < end) {
+
+#ifdef UNIV_HOTBACKUP
+		err = = os_file_write(
+			request, node->name, node->handle, buf, offset,
+			n_bytes);
+#else
+		err = os_aio(
+			request, OS_AIO_SYNC, node->name,
+			node->handle, buf, offset, n_bytes, NULL, NULL);
+#endif /* UNIV_HOTBACKUP */
+
+		if (err != DB_SUCCESS) {
+			break;
+		}
+
+		offset += n_bytes;
+
+		n_bytes = ut_min(n_bytes, (start + len) - offset);
+
+		DBUG_EXECUTE_IF("ib_crash_during_tablespace_extension",
+				DBUG_SUICIDE(););
+	}
+
+	::ut_free(ptr);
+
+	return(err);
+}
+
+/**
 Tries to extend a data file so that it would accommodate the number of pages
 given. The tablespace must be cached in the memory cache. If the space is big
 enough already, does nothing.
@@ -4742,7 +4922,8 @@ retry:
 		return(true);
 	}
 
-	const ulint	page_size = page_size_t(space->flags).physical();
+	page_size_t	pageSize(space->flags);
+	const ulint	page_size = pageSize.physical();
 	fil_node_t*	node = UT_LIST_GET_LAST(space->chain);
 
 	if (!node->being_extended) {
@@ -4774,112 +4955,97 @@ retry:
 	we have set the node->being_extended flag. */
 	mutex_exit(&fil_system->mutex);
 
-	ulint		pages_added = 0;
-	os_offset_t	start_page_no = space->size;
+	ulint		pages_added;
 
-#if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
-	/* Note: This code is going to be execute independent of FusionIO HW
+	/* Note: This code is going to be executed independent of FusionIO HW
 	if the OS supports posix_fallocate() */
-	os_offset_t	start = start_page_no * page_size;
-	os_offset_t	end = (size_after_extend - start_page_no) * page_size;
 
-	DBUG_EXECUTE_IF("ib_crash_during_tablespace_extension",
-			DBUG_SUICIDE(););
+	ut_ad(size_after_extend > space->size);
 
-	/* This is also required by FusionIO HW/Firmware */
-	if (posix_fallocate(node->handle, start, end) == -1) {
+	os_offset_t	node_start = os_file_get_size(node->handle);
+	ut_a(node_start != (os_offset_t) -1);
 
-		ib_logf(IB_LOG_LEVEL_ERROR,
-			"posix_fallocate(): Failed to preallocate"
-			" data for file %s, desired size %lu."
-			" Operating system error number %lu. Check"
-			" that the disk is not full or a disk quota"
-			" exceeded. Some operating system error"
-			" numbers are described at " REFMAN ""
-			" operating-system-error-codes.html",
-			node->name, (ulong) end, (ulong) errno);
+	/* Node first page number */
+	ulint		node_first_page = space->size - node->size;
 
-		success = false;
-	} else {
-		success = true;
-	}
+	/* Number of physical pages in the node/file */
+	ulint		n_node_physical_pages = node_start / page_size;
 
-	if (success) {
-		pages_added = size_after_extend - start_page_no;
-		os_has_said_disk_full = FALSE;
-	}
-#else
-	byte*		buf;
-	byte*		ptr;
-	ulint		buf_size;
-	os_offset_t	file_start_page_no = start_page_no - node->size;
+	/* Pages to extend in the node/file */
+	lint		n_node_extend;
 
-	/* Extend at most 64 pages at a time */
-	buf_size = ut_min(64, size_after_extend - start_page_no) * page_size;
+	n_node_extend = size_after_extend - (node_first_page + node->size);
 
-	ptr = static_cast<byte*>(ut_malloc(buf_size + page_size));
-	buf = static_cast<byte*>(ut_align(ptr, (ulint) page_size));
+	ut_a(n_node_extend >= 0);
 
-	::memset(buf, 0, buf_size);
-
-	while (start_page_no < size_after_extend) {
-
-		ulint	n_pages;
-
-		n_pages = ut_min(
-			buf_size / (ulint) page_size,
-			size_after_extend - start_page_no);
-
-		os_offset_t	offset;
-
-		offset = os_offset_t(start_page_no - file_start_page_no);
-		offset *= page_size;
-
-#ifdef UNIV_HOTBACKUP
-		success = os_file_write(node->name, node->handle, buf,
-					offset, page_size * n_pages);
-#else
-		success = os_aio(OS_FILE_WRITE, OS_AIO_SYNC,
-				 node->name, node->handle, buf,
-				 offset, page_size * n_pages,
-				 NULL, NULL);
-#endif /* UNIV_HOTBACKUP */
-		if (success) {
-			os_has_said_disk_full = false;
-		} else {
-			/* Let us measure the size of the file to determine
-			how much we were able to extend it */
-			os_offset_t	size;
-
-			size = os_file_get_size(node->handle);
-			ut_a(size != (os_offset_t) -1);
-
-			n_pages = ((ulint) (size / page_size))
-				- node->size - pages_added;
-
-			pages_added += n_pages;
-			break;
-		}
-
-		start_page_no += n_pages;
-		pages_added += n_pages;
+	/* If we already have enough physical pages to satisfy the
+	extend request on the node then ignore it */
+	if (node->size + n_node_extend > n_node_physical_pages) {
 
 		DBUG_EXECUTE_IF("ib_crash_during_tablespace_extension",
 				DBUG_SUICIDE(););
-	}
 
-	::ut_free(ptr);
+		os_offset_t     len;
+		dberr_t		err = DB_SUCCESS;
+
+		len = ((node->size + n_node_extend) * page_size) - node_start;
+
+#if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
+		/* This is required by FusionIO HW/Firmware */
+		int	ret = posix_fallocate(node->handle, node_start, len);
+
+		if (ret != 0) {
+
+			ib_logf(IB_LOG_LEVEL_ERROR,
+				"posix_fallocate(): Failed to preallocate"
+				" data for file %s, desired size %lu bytes."
+				" Operating system error number %d. Check"
+				" that the disk is not full or a disk quota"
+				" exceeded. Some operating system error"
+				" numbers are described at " REFMAN ""
+				" operating-system-error-codes.html",
+				node->name, (ulong) len, ret);
+
+			err = DB_IO_ERROR;
+		}
 #endif /* NO_FALLOCATE || !UNIV_LINUX */
+
+		if (!node->atomic_write || err == DB_IO_ERROR) {
+
+			err = fil_write_zeros(node, page_size, node_start, len);
+
+			if (err != DB_SUCCESS) {
+				ib_logf(IB_LOG_LEVEL_WARN,
+					"Error %s while writing %lu zeroes to %s"
+					" starting at offset  %lu",
+					ut_strerr(err), (ulint) len,
+					node->name, (ulint) node_start);
+			}
+		}
+
+		/* Check how many pages actually added */
+		os_offset_t	end = os_file_get_size(node->handle);
+		ut_a(end != (os_offset_t) -1);
+
+		os_has_said_disk_full = !(success = (end == node_start + len));
+
+		pages_added = (end - node_start) / page_size;
+
+	} else {
+		success = true;
+		pages_added = n_node_extend;
+		os_has_said_disk_full = FALSE;
+	}
 
 	mutex_enter(&fil_system->mutex);
 
 	ut_a(node->being_extended);
 
-	space->size += pages_added;
 	node->size += pages_added;
+	space->size += pages_added;
 	node->being_extended = false;
 
-	fil_node_complete_io(node, fil_system, OS_FILE_WRITE);
+	fil_node_complete_io(node, fil_system, IORequestWrite);
 
 	*actual_size = space->size;
 
@@ -5110,16 +5276,17 @@ fil_node_complete_io(
 /*=================*/
 	fil_node_t*	node,	/*!< in: file node */
 	fil_system_t*	system,	/*!< in: tablespace memory cache */
-	ulint		type)	/*!< in: OS_FILE_WRITE or OS_FILE_READ; marks
-				the node as modified if
-				type == OS_FILE_WRITE */
+	const IORequest&type)	/*!< in: IO_TYPE_*, marks the node as
+				modified if TYPE_IS_WRITE() */
 {
 	ut_ad(mutex_own(&system->mutex));
 	ut_a(node->n_pending > 0);
 
 	--node->n_pending;
 
-	if (type == OS_FILE_WRITE) {
+	ut_ad(type.validate());
+
+	if (type.is_write()) {
 		ut_ad(!srv_read_only_mode);
 		system->modification_counter++;
 		node->modification_counter = system->modification_counter;
@@ -5148,51 +5315,51 @@ fil_node_complete_io(
 	}
 }
 
-/********************************************************************//**
+/**
 Report information about an invalid page access. */
 static
 void
 fil_report_invalid_page_access(
-/*===========================*/
 	ulint		block_offset,	/*!< in: block offset */
 	ulint		space_id,	/*!< in: space id */
 	const char*	space_name,	/*!< in: space name */
 	ulint		byte_offset,	/*!< in: byte offset */
 	ulint		len,		/*!< in: I/O length */
-	ulint		type)		/*!< in: I/O type */
+	bool		is_read)	/*!< in: I/O type */
 {
 	ib_logf(IB_LOG_LEVEL_ERROR,
 		"Trying to access page number %lu in space %lu, space name %s,"
 		" which is outside the tablespace bounds. Byte offset %lu,"
-		" len %lu, i/o type %lu. If you get this error at mysqld"
+		" len %lu, i/o type %s. If you get this error at mysqld"
 		" startup, please check that your my.cnf matches the ibdata"
 		" files that you have in the MySQL server.",
 		(ulong) block_offset, (ulong) space_id, space_name,
-		(ulong) byte_offset, (ulong) len, (ulong) type);
+		(ulong) byte_offset, (ulong) len,
+		is_read ? "read" : "write");
 }
 
 /** Reads or writes data. This operation could be asynchronous (aio).
-@param[in]	type		OS_FILE_READ or OS_FILE_WRITE, ORed to
-OS_FILE_LOG, if a log i/o and ORed to OS_AIO_SIMULATED_WAKE_LATER if
-simulated aio and we want to post a batch of IOs; NOTE that a simulated
-batch may introduce hidden chances of deadlocks, because IOs are not
-actually handled until all have been posted: use with great caution!
-@param[in]	sync		true if synchronous aio is desired
-@param[in]	page_id		page id
-@param[in]	page_size	page size
-@param[in]	byte_offset	remainder of offset in bytes; in aio this
-must be divisible by the OS block size
-@param[in]	len		how many bytes to read or write; this must
-not cross a file boundary; in aio this must be a block size multiple
-@param[in,out]	buf		buffer where to store read data or from where
-to write; in aio this must be appropriately aligned
-@param[in]	message		message for aio handler if non-sync aio used,
-else ignored
+
+@param[in,out] type	IO context
+@param[in] sync		true if synchronous aio is desired
+@param[in] page_id	page id
+@param[in] page_size	page size
+@param[in] byte_offset	remainder of offset in bytes; in aio this
+			must be divisible by the OS block size
+@param[in] len		how many bytes to read or write; this must
+			not cross a file boundary; in aio this must
+			be a block size multiple
+@param[in,out] buf	buffer where to store read data or from where
+			to write; in aio this must be appropriately
+			aligned
+@param[in] message	message for aio handler if non-sync aio
+			used, else ignored
+
 @return DB_SUCCESS, DB_TABLESPACE_DELETED or DB_TABLESPACE_TRUNCATED
-if we are trying to do i/o on a tablespace which does not exist */
+	if we are trying to do i/o on a tablespace which does not exist */
 dberr_t
 fil_io(
-	ulint			type,
+	IORequest&		type,
 	bool			sync,
 	const page_id_t&	page_id,
 	const page_size_t&	page_size,
@@ -5201,28 +5368,20 @@ fil_io(
 	void*			buf,
 	void*			message)
 {
-	ulint		mode;
-	fil_space_t*	space;
-	fil_node_t*	node;
-	bool		ret;
-	ulint		is_log;
-	ulint		wake_later;
-	os_offset_t	offset;
-	ulint		ignore_nonexistent_pages;
+	ulint			mode;
+	os_offset_t		offset;
+	IORequest		req_type(type);
 
-	is_log = type & OS_FILE_LOG;
-	type = type & ~OS_FILE_LOG;
+	ut_ad(req_type.validate());
 
-	wake_later = type & OS_AIO_SIMULATED_WAKE_LATER;
-	type = type & ~OS_AIO_SIMULATED_WAKE_LATER;
+	/* We never compress the first page */
+	if (page_id.page_no() == 0) {
+		req_type.clear_compressed();
+	}
 
-	ignore_nonexistent_pages = type & BUF_READ_IGNORE_NONEXISTENT_PAGES;
-	type &= ~BUF_READ_IGNORE_NONEXISTENT_PAGES;
-
+	ut_ad(len > 0);
 	ut_ad(byte_offset < UNIV_PAGE_SIZE);
 	ut_ad(!page_size.is_compressed() || byte_offset == 0);
-	ut_ad(buf);
-	ut_ad(len > 0);
 	ut_ad(UNIV_PAGE_SIZE == (ulong)(1 << UNIV_PAGE_SIZE_SHIFT));
 #if (1 << UNIV_PAGE_SIZE_SHIFT_MAX) != UNIV_PAGE_SIZE_MAX
 # error "(1 << UNIV_PAGE_SIZE_SHIFT_MAX) != UNIV_PAGE_SIZE_MAX"
@@ -5234,18 +5393,29 @@ fil_io(
 #ifndef UNIV_HOTBACKUP
 	/* ibuf bitmap pages must be read in the sync aio mode: */
 	ut_ad(recv_no_ibuf_operations
-	      || type == OS_FILE_WRITE
+	      || req_type.is_write()
 	      || !ibuf_bitmap_page(page_id, page_size)
 	      || sync
-	      || is_log);
+	      || req_type.is_log());
+
 	if (sync) {
+
 		mode = OS_AIO_SYNC;
-	} else if (is_log) {
+
+	} else if (req_type.is_log()) {
+
 		mode = OS_AIO_LOG;
-	} else if (type == OS_FILE_READ
+
+	} else if (req_type.is_read()
 		   && !recv_no_ibuf_operations
 		   && ibuf_page(page_id, page_size, NULL)) {
+
 		mode = OS_AIO_IBUF;
+
+		/* Reduce probability of deadlock bugs in connection with ibuf:
+		do not let the ibuf i/o handler sleep */
+		 
+		req_type.clear_do_not_wake();
 	} else {
 		mode = OS_AIO_NORMAL;
 	}
@@ -5254,9 +5424,12 @@ fil_io(
 	mode = OS_AIO_SYNC;
 #endif /* !UNIV_HOTBACKUP */
 
-	if (type == OS_FILE_READ) {
+	if (req_type.is_read()) {
+
 		srv_stats.data_read.add(len);
-	} else if (type == OS_FILE_WRITE) {
+
+	} else if (req_type.is_write()) {
+
 		ut_ad(!srv_read_only_mode);
 		srv_stats.data_written.add(len);
 	}
@@ -5266,21 +5439,23 @@ fil_io(
 
 	fil_mutex_enter_and_prepare_for_io(page_id.space());
 
-	space = fil_space_get_by_id(page_id.space());
+	fil_space_t*	space = fil_space_get_by_id(page_id.space());
 
 	/* If we are deleting a tablespace we don't allow any read
 	operations on that. However, we do allow write operations. */
 	if (space == NULL
-	    || (type == OS_FILE_READ
-		&& space->stop_new_ops && !space->is_being_truncated)) {
+	    || (req_type.is_read()
+		&& space->stop_new_ops
+		&& !space->is_being_truncated)) {
+
 		mutex_exit(&fil_system->mutex);
 
 		ib_logf(IB_LOG_LEVEL_ERROR,
 			"Trying to do i/o to a tablespace which does "
-			"not exist. i/o type %lu, space id " UINT32PF ", "
+			"not exist. %s, space id " UINT32PF ", "
 			"page no. " UINT32PF ", i/o length %lu bytes",
-			(ulong) type, page_id.space(), page_id.page_no(),
-			(ulong) len);
+			req_type.is_read() ? "read" : "write",
+			page_id.space(), page_id.page_no(), (ulong) len);
 
 		return(DB_TABLESPACE_DELETED);
 	}
@@ -5289,20 +5464,22 @@ fil_io(
 	      || space->purpose == FIL_TYPE_TABLESPACE
 	      || space->purpose == FIL_TYPE_TEMPORARY);
 
-	node = UT_LIST_GET_FIRST(space->chain);
-
-	ulint	cur_page_no = page_id.page_no();
+	ulint		cur_page_no = page_id.page_no();
+	fil_node_t*	node = UT_LIST_GET_FIRST(space->chain);
 
 	for (;;) {
+
 		if (node == NULL) {
-			if (ignore_nonexistent_pages != 0) {
+
+			if (req_type.ignore_missing()) {
 				mutex_exit(&fil_system->mutex);
 				return(DB_ERROR);
 			}
 
 			fil_report_invalid_page_access(
 				cur_page_no, page_id.space(),
-				space->name, byte_offset, len, type);
+				space->name, byte_offset, len,
+				req_type.is_read());
 
 			ut_error;
 
@@ -5312,15 +5489,18 @@ fil_io(
 			/* We do not know the size of a single-table tablespace
 			before we open the file */
 			break;
+
 		} else if (node->size > cur_page_no) {
 			/* Found! */
 			break;
+
 		} else {
 			if (space->id != srv_sys_space.space_id()
 			    && UT_LIST_GET_LEN(space->chain) == 1
 			    && (srv_is_tablespace_truncated(space->id)
 				|| space->is_being_truncated)
-			    && type == OS_FILE_READ) {
+			    && req_type.is_read()) {
+
 				/* Handle page which is outside the truncated
 				tablespace bounds when recovering from a crash
 				happened during a truncation */
@@ -5344,10 +5524,10 @@ fil_io(
 			ib_logf(IB_LOG_LEVEL_ERROR,
 				"Trying to do i/o to a tablespace which "
 				"exists without .ibd data file. "
-				"i/o type %lu, space id " UINT32PF
+				"i/o type %s, space id " UINT32PF
 				", page no " ULINTPF ", "
 				"i/o length %lu bytes",
-				(ulint) type,
+				req_type.is_read() ? "read" : "write",
 				page_id.space(),
 				cur_page_no,
 				(ulint) len);
@@ -5371,7 +5551,7 @@ fil_io(
 
 		fil_report_invalid_page_access(
 			cur_page_no, page_id.space(),
-			space->name, byte_offset, len, type);
+			space->name, byte_offset, len, req_type.is_read());
 
 		ut_error;
 	}
@@ -5382,6 +5562,7 @@ fil_io(
 	/* Calculate the low 32 bits and the high 32 bits of the file offset */
 
 	if (!page_size.is_compressed()) {
+
 		offset = ((os_offset_t) cur_page_no
 			  << UNIV_PAGE_SIZE_SHIFT) + byte_offset;
 
@@ -5408,26 +5589,53 @@ fil_io(
 		     / page_size.physical());
 	}
 
-	/* Do aio */
+	/* Do AIO */
 
 	ut_a(byte_offset % OS_FILE_LOG_BLOCK_SIZE == 0);
 	ut_a((len % OS_FILE_LOG_BLOCK_SIZE) == 0);
 
+	if (req_type.is_write()
+	    && req_type.is_compressed()
+	    && IORequest::have_punch_hole()
+	    && node->punch_hole) {
+
+		req_type.set_punch_hole();
+	} else {
+		req_type.clear_punch_hole();
+	}
+
+	req_type.block_size(node->block_size);
+
+	dberr_t	err;
+
 #ifdef UNIV_HOTBACKUP
 	/* In ibbackup do normal i/o, not aio */
-	if (type == OS_FILE_READ) {
-		ret = os_file_read(node->handle, buf, offset, len);
+	if (req_type.is_read()) {
+		err = os_file_read(req_type, node->handle, buf, offset, len);
 	} else {
 		ut_ad(!srv_read_only_mode);
-		ret = os_file_write(node->name, node->handle, buf,
-				    offset, len);
+
+		err = os_file_write(
+			req_type, node->name, node->handle, buf, offset, len);
 	}
 #else
 	/* Queue the aio request */
-	ret = os_aio(type, mode | wake_later, node->name, node->handle, buf,
-		     offset, len, node, message);
+	err = os_aio(
+		req_type,
+		mode, node->name, node->handle, buf, offset, len, node, message);
+
 #endif /* UNIV_HOTBACKUP */
-	ut_a(ret);
+
+	if (err == DB_IO_NO_PUNCH_HOLE) {
+
+		err = DB_SUCCESS;
+
+	       	if (node->punch_hole) {
+			node->punch_hole = false;
+		}
+	}
+
+	ut_a(err == DB_SUCCESS);
 
 	if (mode == OS_AIO_SYNC) {
 		/* The i/o operation is already completed when we return from
@@ -5459,9 +5667,9 @@ fil_aio_wait(
 				array to wait for */
 {
 	bool		ret;
+	IORequest	type;
 	fil_node_t*	fil_node;
 	void*		message;
-	ulint		type;
 
 	ut_ad(fil_validate_skip());
 
@@ -5510,7 +5718,12 @@ fil_aio_wait(
 	case FIL_TYPE_TABLESPACE:
 	case FIL_TYPE_TEMPORARY:
 		srv_set_io_thread_op_info(segment, "complete io for buf page");
-		buf_page_io_complete(static_cast<buf_page_t*>(message));
+
+		/* async single page writes from the dblwr buffer don't have
+		access to the page */
+		if (message != NULL) {
+			buf_page_io_complete(static_cast<buf_page_t*>(message));
+		}
 		return;
 	case FIL_TYPE_LOG:
 		srv_set_io_thread_op_info(segment, "complete io for log");
@@ -5948,9 +6161,21 @@ fil_iterate(
 	copying for non-index pages. Unfortunately, it is
 	required by buf_zip_decompress() */
 
+	ulint	read_type = IORequest::READ;
+	ulint	write_type = IORequest::WRITE;
+
+	if (!callback.get_page_size().is_compressed()) {
+		read_type |= IORequest::COMPRESS;
+		write_type |= IORequest::COMPRESS;
+		
+		if (IORequest::have_punch_hole) {
+			write_type |= IORequest::PUNCH_HOLE;
+		}
+	}
+
 	for (offset = iter.start; offset < iter.end; offset += n_bytes) {
 
-		byte*		io_buffer = iter.io_buffer;
+		byte*	io_buffer = iter.io_buffer;
 
 		block->frame = io_buffer;
 
@@ -5984,12 +6209,17 @@ fil_iterate(
 		ut_ad(n_bytes > 0);
 		ut_ad(!(n_bytes % iter.page_size));
 
-		if (!os_file_read(iter.file, io_buffer, offset,
-				  (ulint) n_bytes)) {
+		dberr_t		err;
+		IORequest	read_request(read_type);
 
+		err = os_file_read(
+			read_request, iter.file, io_buffer, offset,
+			(ulint) n_bytes);
+
+		if (err != DB_SUCCESS) {
 			ib_logf(IB_LOG_LEVEL_ERROR, "os_file_read() failed");
 
-			return(DB_IO_ERROR);
+			return(err);
 		}
 
 		bool		updated = false;
@@ -6000,8 +6230,6 @@ fil_iterate(
 
 			buf_block_set_file_page(
 				block, page_id_t(space_id, page_no++));
-
-			dberr_t	err;
 
 			if ((err = callback(page_off, block)) != DB_SUCCESS) {
 
@@ -6019,15 +6247,26 @@ fil_iterate(
 			block->frame += iter.page_size;
 		}
 
+		IORequest	write_request(write_type);
+
 		/* A page was updated in the set, write back to disk. */
 		if (updated
-		    && !os_file_write(
+		    && (err = os_file_write(
+			    	write_request,
 				iter.filepath, iter.file, io_buffer,
-				offset, (ulint) n_bytes)) {
+				offset, (ulint) n_bytes)) != DB_SUCCESS) {
 
-			ib_logf(IB_LOG_LEVEL_ERROR, "os_file_write() failed");
+			/* This is not a hard error */
+			if (err == DB_IO_NO_PUNCH_HOLE) {
 
-			return(DB_IO_ERROR);
+				err = DB_SUCCESS;
+				write_type &= ~IORequest::PUNCH_HOLE;
+
+			} else {
+				ib_logf(IB_LOG_LEVEL_ERROR,
+					"os_file_write() failed");
+				return(err);
+			}
 		}
 	}
 
@@ -6131,7 +6370,11 @@ fil_tablespace_iterate(
 
 	/* Read the first page and determine the page and zip size. */
 
-	if (!os_file_read(file, page, 0, UNIV_PAGE_SIZE)) {
+	IORequest	request(IORequest::READ);
+
+	err = os_file_read(request, file, page, 0, UNIV_PAGE_SIZE);
+
+	if (err != DB_SUCCESS) {
 
 		err = DB_IO_ERROR;
 
@@ -6414,6 +6657,15 @@ truncate_t::truncate(
 	::ut_free(path);
 
 	return(err);
+}
+
+/**
+Note that the file system where the file resides doesn't support PUNCH HOLE.
+Called from AIO handlers when IO returns DB_IO_NO_PUNCH_HOLE */
+void
+fil_no_punch_hole(fil_node_t* node)
+{
+	node->punch_hole = false;
 }
 
 /* Unit Tests */

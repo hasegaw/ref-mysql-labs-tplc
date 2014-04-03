@@ -45,10 +45,11 @@ Created 10/25/1995 Heikki Tuuri
 
 // Forward declaration
 struct trx_t;
+class page_id_t;
 class truncate_t;
+struct fil_node_t;
 struct fil_space_t;
 struct btr_create_t;
-class page_id_t;
 
 typedef std::list<const char*> space_name_list_t;
 
@@ -76,6 +77,8 @@ extern const char* dot_ext[];
 enum fil_type_t {
 	/** temporary tablespace (temporary undo log or tables) */
 	FIL_TYPE_TEMPORARY,
+	/** a tablespace that is being imported (no logging until finished) */
+	FIL_TYPE_IMPORT = FIL_TYPE_TEMPORARY,
 	/** persistent tablespace (for system, undo log or tables) */
 	FIL_TYPE_TABLESPACE,
 	/** redo log covering changes to files of FIL_TYPE_TABLESPACE */
@@ -153,12 +156,35 @@ extern fil_addr_t	fil_addr_null;
 					first page in a system tablespace
 					data file (ibdata*, not *.ibd):
 					the file has been flushed to disk
-					at least up to this lsn */
+					at least up to this LSN. For 
+					FIL_PAGE_COMPRESSED pages, we store
+					the compressed page control information
+					in these 8 bytes. */
+
+/** If page type is FIL_PAGE_COMPRESSED then the 8 bytes starting at
+FIL_PAGE_FILE_FLUSH_LSN are broken down as follows: */
+
+/** Control information version format (u8) */
+static const ulint FIL_PAGE_VERSION = FIL_PAGE_FILE_FLUSH_LSN;
+
+/** Compression algorithm (u8) */
+static const ulint FIL_PAGE_ALGORITHM_V1 = FIL_PAGE_VERSION + 1;
+
+/** Original page type (u16) */
+static const ulint FIL_PAGE_ORIGINAL_TYPE_V1 = FIL_PAGE_ALGORITHM_V1 + 1;
+
+/** Original data size in bytes (u16)*/
+static const ulint FIL_PAGE_ORIGINAL_SIZE_V1 = FIL_PAGE_ORIGINAL_TYPE_V1 + 2;
+
+/** Size after compression (u16)*/
+static const ulint FIL_PAGE_COMPRESS_SIZE_V1 = FIL_PAGE_ORIGINAL_SIZE_V1 + 2;
+
 #define FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID  34 /*!< starting from 4.1.x this
 					contains the space id of the page */
 #define FIL_PAGE_SPACE_ID  FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID
 
 #define FIL_PAGE_DATA		38	/*!< start of the data on the page */
+
 /* @} */
 /** File page trailer @{ */
 #define FIL_PAGE_END_LSN_OLD_CHKSUM 8	/*!< the low 4 bytes of this are used
@@ -183,7 +209,8 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_PAGE_TYPE_BLOB	10	/*!< Uncompressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB	11	/*!< First compressed BLOB page */
 #define FIL_PAGE_TYPE_ZBLOB2	12	/*!< Subsequent compressed BLOB page */
-#define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_ZBLOB2
+#define FIL_PAGE_COMPRESSED	13	/*!< Compressed page */
+#define FIL_PAGE_TYPE_LAST	FIL_PAGE_COMPRESSED
 					/*!< Last page type */
 /* @} */
 
@@ -229,7 +256,7 @@ fil_space_get_type(
 	ulint	id);
 
 /** @brief Note that a tablespace has been imported.
-It is initially marked as FIL_TYPE_TEMPORARY so that no logging is
+It is initially marked as FIL_TYPE_IMPORT so that no logging is
 done during the import process when the space ID is stamped to each page.
 Now we change it to FIL_SPACE_TABLESPACE to start redo and undo logging.
 NOTE: temporary tablespaces are never imported.
@@ -260,8 +287,10 @@ fil_node_create(
 	ulint		size,	/*!< in: file size in database blocks, rounded
 				downwards to an integer */
 	fil_space_t*	space,	/*!< in,out: space where to append */
-	bool		is_raw)	/*!< in: true if a raw device or
+	bool		is_raw,	/*!< in: true if a raw device or
 				a raw disk partition */
+	bool		atomic_write)
+				/*!< in: true if atomic write enabled */
 	__attribute__((warn_unused_result));
 
 /** Creates a space memory object and puts it to the 'fil system' hash table.
@@ -784,27 +813,27 @@ fil_space_get_n_reserved_extents(
 	ulint	id);		/*!< in: space id */
 
 /** Reads or writes data. This operation could be asynchronous (aio).
-@param[in]	type		OS_FILE_READ or OS_FILE_WRITE, ORed to
-OS_FILE_LOG, if a log i/o and ORed to OS_AIO_SIMULATED_WAKE_LATER if
-simulated aio and we want to post a batch of IOs; NOTE that a simulated
-batch may introduce hidden chances of deadlocks, because IOs are not
-actually handled until all have been posted: use with great caution!
+
+@param[in]	type		IO context
 @param[in]	sync		true if synchronous aio is desired
 @param[in]	page_id		page id
 @param[in]	page_size	page size
 @param[in]	byte_offset	remainder of offset in bytes; in aio this
-must be divisible by the OS block size
+				must be divisible by the OS block size
 @param[in]	len		how many bytes to read or write; this must
-not cross a file boundary; in aio this must be a block size multiple
+				not cross a file boundary; in aio this must
+				be a block size multiple
 @param[in,out]	buf		buffer where to store read data or from where
-to write; in aio this must be appropriately aligned
-@param[in]	message		message for aio handler if non-sync aio used,
-else ignored
+				to write; in aio this must be appropriately
+				aligned
+@param[in]	message		message for aio handler if non-sync aio
+				used, else ignored
+
 @return DB_SUCCESS, DB_TABLESPACE_DELETED or DB_TABLESPACE_TRUNCATED
 if we are trying to do i/o on a tablespace which does not exist */
 dberr_t
 fil_io(
-	ulint			type,
+	IORequest&		type,
 	bool			sync,
 	const page_id_t&	page_id,
 	const page_size_t&	page_size,
@@ -912,7 +941,7 @@ struct PageCallback {
 
 	/** Default constructor */
 	PageCallback()
-		:
+		: 
 		m_page_size(0, 0, false),
 		m_filepath() UNIV_NOTHROW {}
 
@@ -1046,6 +1075,11 @@ fil_mtr_rename_log(
 					swapping */
 	mtr_t*		mtr);		/*!< in/out: mini-transaction */
 
+/** Determine if (i) is a user tablespace id or not. */
+# define fil_is_user_tablespace_id(i)		\
+	(((i) > srv_undo_tablespaces_open)	\
+	 && ((i) != srv_tmp_space.space_id()))
+
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 /**
 Try and enable FusionIO atomic writes.
@@ -1055,6 +1089,10 @@ Try and enable FusionIO atomic writes.
 bool
 fil_fusionio_enable_atomic_write(os_file_t file);
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
+
+/**
+Note that the file system where the file resides doesn't support PUNCH HOLE */
+void fil_no_punch_hole(fil_node_t* node);
 
 #ifdef UNIV_COMPILE_TEST_FUNCS
 void test_make_filepath();

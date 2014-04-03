@@ -194,7 +194,7 @@ public:
 	@return pointer to the first Datafile for this Tablespace*/
 	Datafile* first_datafile()
 	{
-		return &(m_files.front());
+		return(&m_files.front());
 	}
 
 private:

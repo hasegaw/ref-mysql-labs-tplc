@@ -1,7 +1,7 @@
-revision-id: bjorn.munch@oracle.com-20140319103219-cbqy1cg4naumk3hj
-date: 2014-03-19 11:32:19 +0100
-build-date: 2014-03-19 11:47:44 +0100
-revno: 7626
-branch-nick: mysql-5.7.4-m14-release
+revision-id: sunny.bains@oracle.com-20140327111751-cl8q5wj7eifvcnb2
+date: 2014-03-27 22:17:51 +1100
+build-date: 2014-03-27 15:05:13 +0100
+revno: 7756
+branch-nick: mysql-trunk-wl7696
 
 MySQL source 5.7.4

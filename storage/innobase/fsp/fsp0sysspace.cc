@@ -520,6 +520,7 @@ SysTablespace::read_lsn_and_check_flags()
 		}
 
 		err = it->read_first_page();
+
 		if (err != DB_SUCCESS) {
 			return(err);
 		}
@@ -532,8 +533,12 @@ SysTablespace::read_lsn_and_check_flags()
 
 			set_flags(it->m_flags);
 
-			buf_dblwr_init_or_load_pages(
+			err = buf_dblwr_init_or_load_pages(
 				it->handle(), it->filepath());
+
+			if (err != DB_SUCCESS) {
+				return(err);
+			}
 
 			/* Check the contents of the first page of the
 			first datafile */
@@ -878,7 +883,13 @@ SysTablespace::open_or_create(
 
 				srv_use_doublewrite_buf = false;
 			}
+
+			it->m_atomic_write = true;
+		} else {
+			it->m_atomic_write = false;
 		}
+#else
+		it->m_atomic_write = false;
 #endif /* !NO_FALLOCATE && UNIV_LINUX*/
 	}
 
@@ -918,7 +929,8 @@ SysTablespace::open_or_create(
 		/* Open the data file. */
 		if (!fil_node_create(
 			it->m_filepath, it->m_size,
-			space, it->m_type != SRV_NOT_RAW)) {
+			space, it->m_type != SRV_NOT_RAW, it->m_atomic_write)) {
+
 		       err = DB_ERROR;
 		       break;
 		}

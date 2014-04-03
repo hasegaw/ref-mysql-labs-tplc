@@ -150,6 +150,7 @@ enum srv_shutdown_t {
 				work. Once we enter this phase the
 				page_cleaner can clean up the buffer
 				pool and exit */
+	SRV_SHUTDOWN_FLUSH_DONE,/*!< Flushing complete */
 	SRV_SHUTDOWN_LAST_PHASE,/*!< Last phase after ensuring that
 				the buffer pool can be freed: flush
 				all file spaces and close all files */

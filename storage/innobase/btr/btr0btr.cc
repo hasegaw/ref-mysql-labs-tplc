@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2014, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -231,13 +231,13 @@ btr_height_get(
 					   | MTR_MEMO_X_LOCK
 					   | MTR_MEMO_SX_LOCK));
 
-        /* S latches the page */
-        root_block = btr_root_block_get(index, RW_S_LATCH, mtr);
+	/* S latches the page */
+	root_block = btr_root_block_get(index, RW_S_LATCH, mtr);
 
-        height = btr_page_get_level(buf_block_get_frame(root_block), mtr);
+	height = btr_page_get_level(buf_block_get_frame(root_block), mtr);
 
-        /* Release the S latch on the root page. */
-        mtr->memo_release(root_block, MTR_MEMO_PAGE_S_FIX);
+	/* Release the S latch on the root page. */
+	mtr->memo_release(root_block, MTR_MEMO_PAGE_S_FIX);
 
 #ifdef UNIV_SYNC_DEBUG
 	ut_d(sync_check_unlock(&root_block->lock));
@@ -3048,11 +3048,11 @@ btr_compress(
 
 #ifdef UNIV_BTR_DEBUG
 	if (is_left) {
-                ut_a(btr_page_get_next(merge_page, mtr)
-                     == block->page.id.page_no());
+		ut_a(btr_page_get_next(merge_page, mtr)
+		     == block->page.id.page_no());
 	} else {
-               ut_a(btr_page_get_prev(merge_page, mtr)
-                     == block->page.id.page_no());
+		ut_a(btr_page_get_prev(merge_page, mtr)
+		     == block->page.id.page_no());
 	}
 #endif /* UNIV_BTR_DEBUG */
 

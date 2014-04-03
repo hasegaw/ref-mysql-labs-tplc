@@ -3297,7 +3297,7 @@ Additional Resources
    As an alternative, you can use the package manager on your system
    to automatically download and install MySQL with packages from the
    native software repositories of your Linux distribution. These
-   native package are often several versions behind the currently
+   native packages are often several versions behind the currently
    available release. You will also normally be unable to install
    development milestone releases (DMRs), as these are not usually
    made available in the native repositories. For more information on
@@ -3332,16 +3332,6 @@ Additional Resources
    client, MySQL Workbench, MySQL Utilities (not available for
    EL5-based platforms), Connector/ODBC, and Connector/Python (not
    available for EL5-based platforms).
-
-   MySQL does not currently provide software repositories for other
-   Linux platforms. Refer to Section 2.5, "Installing MySQL on Linux"
-   for instructions on how to install MySQL on those platforms.
-   Note
-
-   The MySQL Yum repository service is now in development release. We
-   encourage you to try it and provide us with feedback. Please
-   report any bugs or inconsistencies you observe to our Bugs
-   Database (http://bugs.mysql.com).
 
 Before You Start
 
@@ -3649,9 +3639,8 @@ shell> sudo yum install mysql-server
        the common error messages and character sets for client and
        server, are now installed from the MySQL Yum repository. To
        install more components for MySQL, see Section 2.5.1, "."
-       Follow the postinstallation procedures exdocbuild-run-cmd
-       push-docs-to-web-staging.sh downloadsplained in Section 2.9,
-       "Postinstallation Setup and Testing."
+       Follow the postinstallation procedures explained in Section
+       2.9, "Postinstallation Setup and Testing."
 
 2.5.3 Installing MySQL on Linux Using RPM Packages
 
@@ -3735,22 +3724,39 @@ shell> sudo yum install mysql-server
    MySQL-client packages to get a functional MySQL installation. The
    other packages are not required for a standard installation.
 
-   New RPM install operations (not upgrades) invoke mysql_install_db
-   with the --random-passwords option that provides for more secure
-   MySQL installation. Invoking mysql_install_db with
-   --random-passwords causes it to assign a random password to the
-   MySQL root accounts, set the "password expired" flag for those
-   accounts, and not create anonymous-user MySQL accounts. It will be
-   necessary after installation to start the server, connect as root
-   using the password written to the $HOME/.mysql_secret file, and
-   assign a new root password. Until this is done, root cannot do
-   anything else. This must be done for each root account you intend
-   to use. To change the password, you can use the SET PASSWORD
-   statement (for example, with the mysql client). You can also use
-   mysqladmin or mysql_secure_installation. For additional details,
-   see Section 4.4.3, "mysql_install_db --- Initialize MySQL Data
-   Directory." (Install operations using RPMs for Unbreakable Linux
-   Network are unaffected because they do not use mysql_install_db.)
+   As of MySQL 5.7.4, MySQL deployments installed using RPM packages
+   are secure by default and have these characteristics:
+
+     * The installation process creates a single root account,
+       'root'@'localhost', automatically generates a random password
+       for this account, and marks the password expired.
+
+     * The initial random root password is written to the
+       .mysql_secret file in the directory named by the HOME
+       environment variable. Depending on operating system, using a
+       command such as sudo may cause the value of HOME to refer to
+       the home directory of the root system user. .mysql_secret is
+       created with mode 600 to be accessible only to the system user
+       for whom it is created.
+       If .mysql_secret already exists, the new password information
+       is appended to it. Each password entry includes a timestamp so
+       that in the event of multiple install operations it is
+       possible to determine the password associated with each one.
+
+     * No anonymous-user MySQL accounts are created.
+
+     * No test database is created.
+
+   As a result of these actions, it is necessary after installation
+   to start the server, connect as root using the password written to
+   the .mysql_secret file, and select a new root password. Until this
+   is done, root cannot do anything else. To change the password, you
+   can use the SET PASSWORD statement (for example, with the mysql
+   client). You can also use mysqladmin or mysql_secure_installation.
+
+   Before MySQL 5.7.4, new RPM install operations produce similar
+   deployment characteristics, except that multiple root accounts may
+   be created, and the test database is created.
 
    For upgrades, if your installation was originally produced by
    installing multiple RPM packages, it is best to upgrade all the
@@ -4006,7 +4012,7 @@ shell> apt-get install libaio1
    installing MySQL using those package management systems.
    Important
 
-   Native package are often several versions behind the currently
+   Native packages are often several versions behind the currently
    available release. You will also normally be unable to install
    development milestone releases (DMRs), as these are not usually
    made available in the native repositories. Before proceeding, we
@@ -4588,7 +4594,7 @@ Source Installation System Requirements
        your system as gmake. GNU make is available from
        http://www.gnu.org/software/make/.
 
-     * A working ANSI C++ compiler. GCC 4.2.1 or later, Sun Studio 10
+     * A working ANSI C++ compiler. GCC 4.2.1 or later, Sun Studio 12
        or later, Visual Studio 2010 or later, and many current
        vendor-supplied compilers are known to work.
 
@@ -5357,8 +5363,16 @@ Storage Engine Options
 -DWITH_BLACKHOLE_STORAGE_ENGINE=1
 -DWITH_PERFSCHEMA_STORAGE_ENGINE=1
 
-   To exclude a storage engine from the build, use
-   -DWITHOUT_engine_STORAGE_ENGINE=1. Examples:
+   As of MySQL 5.7.4, to exclude a storage engine from the build, use
+   -DWITH_engine_STORAGE_ENGINE=0. Examples:
+-DWITH_EXAMPLE_STORAGE_ENGINE=0
+-DWITH_FEDERATED_STORAGE_ENGINE=0
+-DWITH_PARTITION_STORAGE_ENGINE=0
+
+   Before MySQL 5.7.4, to exclude a storage engine from the build,
+   use -DWITHOUT_engine_STORAGE_ENGINE=1. (That syntax also works in
+   5.7.4 or later, but -DWITH_engine_STORAGE_ENGINE=0 is preferred.)
+   Examples:
 -DWITHOUT_EXAMPLE_STORAGE_ENGINE=1
 -DWITHOUT_FEDERATED_STORAGE_ENGINE=1
 -DWITHOUT_PARTITION_STORAGE_ENGINE=1
@@ -6975,9 +6989,9 @@ mysql> DROP DATABASE test;
        kinds of functions.
 
    For EL5, EL6, or EL7-based Linux platforms and Fedora 19 or 20,
-   you can perform an in-place upgrade of MySQL and its components to
-   the latest GA releases with the MySQL Yum repository. See Section
-   2.10.1.1, "Upgrading MySQL with the MySQL Yum Repository."
+   you can perform an in-place upgrade of MySQL and its components
+   with the MySQL Yum repository. See Section 2.10.1.1, "Upgrading
+   MySQL with the MySQL Yum Repository."
 
    For upgrades between versions of a MySQL release series that has
    reached General Availability status, you can move the MySQL format
@@ -7237,6 +7251,28 @@ Upgrading the Shared Client Libraries
 
 Server Changes
 
+
+     * Incompatible change: As of MySQL 5.7.4, the deprecated
+       ERROR_FOR_DIVISION_BY_ZERO, NO_ZERO_DATE, and NO_ZERO_IN_DATE
+       SQL modes do nothing. Instead, their previous effects are
+       included in the effects of strict SQL mode (STRICT_ALL_TABLES
+       or STRICT_TRANS_TABLES). In other words, strict mode now means
+       the same thing as the previous meaning of strict mode plus the
+       ERROR_FOR_DIVISION_BY_ZERO, NO_ZERO_DATE, and NO_ZERO_IN_DATE
+       modes. This change reduces the number of SQL modes with an
+       effect dependent on strict mode and makes them part of strict
+       mode itself.
+       To prepare for these SQL mode changes, it is advisable before
+       upgrading to read Section 5.1.7, "." That discussion provides
+       guidelines to assess whether your applications will be
+       affected by these changes.
+       The deprecated ERROR_FOR_DIVISION_BY_ZERO, NO_ZERO_DATE, and
+       NO_ZERO_IN_DATE SQL modes are still recognized so that
+       statements that name them do not produce an error, but will be
+       removed in a future version of MySQL. To make advance
+       preparation for versions of MySQL in which these modes do not
+       exist, applications should be modified to not refer to those
+       mode names.
 
      * Incompatible change: As of MySQL 5.7.2, the server requires
        account rows in the mysql.user table to have a nonempty plugin

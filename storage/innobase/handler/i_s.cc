@@ -8063,6 +8063,24 @@ static ST_FIELD_INFO	innodb_sys_tablespaces_fields_info[] =
 	 STRUCT_FLD(old_name,		""),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
+#define SYS_TABLESPACES_FILE_SIZE	7
+	{STRUCT_FLD(field_name,		"FILE_SIZE"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		""),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+#define SYS_TABLESPACES_ALLOC_SIZE	8
+	{STRUCT_FLD(field_name,		"ALLOCATED_SIZE"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		""),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
 	END_OF_ST_FIELD_INFO
 
 };
@@ -8100,27 +8118,43 @@ i_s_dict_fill_sys_tablespaces(
 
 	fields = table_to_fill->field;
 
-	OK(fields[SYS_TABLESPACES_SPACE]->store(
-		static_cast<double>(space)));
+	OK(fields[SYS_TABLESPACES_SPACE]->store(static_cast<double>(space)));
 
 	OK(field_store_string(fields[SYS_TABLESPACES_NAME], name));
 
-	OK(fields[SYS_TABLESPACES_FLAGS]->store(
-		static_cast<double>(flags)));
+	OK(fields[SYS_TABLESPACES_FLAGS]->store(static_cast<double>(flags)));
 
-	OK(field_store_string(fields[SYS_TABLESPACES_FILE_FORMAT],
-			      file_format));
+	OK(field_store_string(fields[SYS_TABLESPACES_FILE_FORMAT], file_format));
 
-	OK(field_store_string(fields[SYS_TABLESPACES_ROW_FORMAT],
-			      row_format));
+	OK(field_store_string(fields[SYS_TABLESPACES_ROW_FORMAT], row_format));
 
 	OK(fields[SYS_TABLESPACES_PAGE_SIZE]->store(
 			static_cast<double>(univ_page_size.physical())));
 
-	OK(fields[SYS_TABLESPACES_ZIP_PAGE_SIZE]->store(static_cast<double>(
+	OK(fields[SYS_TABLESPACES_ZIP_PAGE_SIZE]->store(
+			static_cast<double>(
 				page_size.is_compressed()
 				? page_size.physical()
 				: 0)));
+
+	// FIXME: The .isl handling is missing, and better error handling
+	char*	filename = fil_make_filepath(NULL, name, IBD, false);
+
+	os_file_size_t	file_size;
+
+	if (filename != NULL) {
+		file_size = os_file_get_size(filename);
+
+		ut_free(filename);
+	} else {
+		memset(&file_size, 0xff, 0);
+	}
+
+	OK(fields[SYS_TABLESPACES_FILE_SIZE]->store(
+			file_size.m_total_size, true));
+
+	OK(fields[SYS_TABLESPACES_ALLOC_SIZE]->store(
+			file_size.m_alloc_size, true));
 
 	OK(schema_table_store_record(thd, table_to_fill));
 
@@ -8156,9 +8190,10 @@ i_s_sys_tablespaces_fill_table(
 	mutex_enter(&dict_sys->mutex);
 	mtr_start(&mtr);
 
-	rec = dict_startscan_system(&pcur, &mtr, SYS_TABLESPACES);
+	for (rec = dict_startscan_system(&pcur, &mtr, SYS_TABLESPACES);
+	     rec != NULL;
+	     rec = dict_getnext_system(&pcur, &mtr)) {
 
-	while (rec) {
 		const char*	err_msg;
 		ulint		space;
 		const char*	name;
@@ -8186,7 +8221,6 @@ i_s_sys_tablespaces_fill_table(
 		/* Get the next record */
 		mutex_enter(&dict_sys->mutex);
 		mtr_start(&mtr);
-		rec = dict_getnext_system(&pcur, &mtr);
 	}
 
 	mtr_commit(&mtr);

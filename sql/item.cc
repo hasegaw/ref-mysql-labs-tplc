@@ -909,6 +909,13 @@ bool Item_field::add_field_to_set_processor(uchar *arg)
   DBUG_RETURN(FALSE);
 }
 
+bool Item_field::add_field_to_cond_set_processor(uchar *unused)
+{
+  DBUG_ENTER("Item_field::add_field_to_cond_set_processor");
+  DBUG_PRINT("info", ("%s", field->field_name ? field->field_name : "noname"));
+  bitmap_set_bit(&field->table->cond_set, field->field_index);
+  DBUG_RETURN(false);
+}
 
 bool Item_field::remove_column_from_bitmap(uchar *argument)
 {
@@ -6758,7 +6765,7 @@ bool Item_null::send(Protocol *protocol, String *packet)
 
 bool Item::send(Protocol *protocol, String *buffer)
 {
-  bool UNINIT_VAR(result);                       // Will be set if null_value == 0
+  bool result= false;                       // Will be set if null_value == 0
   enum_field_types f_type;
 
   switch ((f_type=field_type())) {
@@ -7057,6 +7064,55 @@ void Item_field::print(String *str, enum_query_type query_type)
   Item_ident::print(str, query_type);
 }
 
+/**
+  Calculate condition filtering effect for "WHERE field", which
+  implicitly means "WHERE field <> 0". The filtering effect is
+  therefore identical to that of Item_func_ne.
+*/
+float Item_field::get_filtering_effect(table_map filter_for_table,
+                                       table_map read_tables,
+                                       const MY_BITMAP *fields_to_ignore,
+                                       double rows_in_table)
+{
+  if (used_tables() != filter_for_table ||
+      bitmap_is_set(fields_to_ignore, field->field_index))
+    return COND_FILTER_ALLPASS;
+
+  return 1.0f - get_cond_filter_default_probability(rows_in_table,
+                                                    COND_FILTER_EQUALITY);
+}
+
+float
+Item_field::get_cond_filter_default_probability(double max_distinct_values,
+                                                float default_filter) const
+{
+  DBUG_ASSERT(max_distinct_values >= 1.0);
+
+  // Some field types have a limited number of possible values
+  const enum_field_types fld_type= field->real_type();
+  switch (fld_type)
+  {
+  case MYSQL_TYPE_ENUM:
+  {
+    // ENUM can only have the values defined in the typelib
+    const uint enum_values= static_cast<Field_enum*>(field)->typelib->count;
+    max_distinct_values= std::min(static_cast<double>(enum_values),
+                                  max_distinct_values);
+    break;
+  }
+  case MYSQL_TYPE_BIT:
+  {
+    // BIT(N) can have no more than 2^N distinct values
+    const uint bits= static_cast<Field_bit*>(field)->field_length;
+    const double combos= pow(2.0, (int)bits);
+    max_distinct_values= std::min(combos, max_distinct_values);
+    break;
+  }
+  default:
+    break;
+  }
+  return std::max(static_cast<float>(1/max_distinct_values), default_filter);
+}
 
 Item_ref::Item_ref(Name_resolution_context *context_arg,
                    Item **item, const char *table_name_arg,
@@ -8188,7 +8244,7 @@ void Item_trigger_field::setup_field(THD *thd,
     set field_idx properly.
   */
   (void) find_field_in_table(thd, table_triggers->get_subject_table(),
-                             field_name, (uint) strlen(field_name),
+                             field_name, strlen(field_name),
                              0, &field_idx);
   thd->mark_used_columns= save_mark_used_columns;
   triggers= table_triggers;

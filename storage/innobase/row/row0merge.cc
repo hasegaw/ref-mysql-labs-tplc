@@ -708,25 +708,27 @@ row_merge_read(
 	row_merge_block_t*	buf)	/*!< out: data */
 {
 	os_offset_t	ofs = ((os_offset_t) offset) * srv_sort_buf_size;
-	ibool		success;
 
 	DBUG_ENTER("row_merge_read");
 	DBUG_PRINT("ib_merge_sort", ("fd=%d ofs=" UINT64PF, fd, ofs));
 	DBUG_EXECUTE_IF("row_merge_read_failure", DBUG_RETURN(FALSE););
 
-	success = os_file_read_no_error_handling(OS_FILE_FROM_FD(fd), buf,
-						 ofs, srv_sort_buf_size);
+	IORequest	request;
+
+	dberr_t	err = os_file_read_no_error_handling(
+		request,
+		OS_FILE_FROM_FD(fd), buf, ofs, srv_sort_buf_size);
 #ifdef POSIX_FADV_DONTNEED
 	/* Each block is read exactly once.  Free up the file cache. */
 	posix_fadvise(fd, ofs, srv_sort_buf_size, POSIX_FADV_DONTNEED);
 #endif /* POSIX_FADV_DONTNEED */
 
-	if (UNIV_UNLIKELY(!success)) {
+	if (err != DB_SUCCESS) {
 		ib_logf(IB_LOG_LEVEL_ERROR,
 			"Failed to read merge block at " UINT64PF, ofs);
 	}
 
-	DBUG_RETURN(success);
+	DBUG_RETURN(err == DB_SUCCESS);
 }
 
 /********************************************************************//**
@@ -743,13 +745,16 @@ row_merge_write(
 {
 	size_t		buf_len = srv_sort_buf_size;
 	os_offset_t	ofs = buf_len * (os_offset_t) offset;
-	ibool		ret;
 
 	DBUG_ENTER("row_merge_write");
 	DBUG_PRINT("ib_merge_sort", ("fd=%d ofs=" UINT64PF, fd, ofs));
 	DBUG_EXECUTE_IF("row_merge_write_failure", DBUG_RETURN(FALSE););
 
-	ret = os_file_write("(merge)", OS_FILE_FROM_FD(fd), buf, ofs, buf_len);
+	IORequest	request(IORequest::WRITE);
+
+	dberr_t	err = os_file_write(
+		request,
+		"(merge)", OS_FILE_FROM_FD(fd), buf, ofs, buf_len);
 
 #ifdef POSIX_FADV_DONTNEED
 	/* The block will be needed on the next merge pass,
@@ -757,7 +762,7 @@ row_merge_write(
 	posix_fadvise(fd, ofs, buf_len, POSIX_FADV_DONTNEED);
 #endif /* POSIX_FADV_DONTNEED */
 
-	DBUG_RETURN(ret);
+	DBUG_RETURN(err == DB_SUCCESS);
 }
 
 /********************************************************************//**

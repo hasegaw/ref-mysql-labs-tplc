@@ -53,9 +53,10 @@ At a database startup initializes the doublewrite buffer memory structure if
 we already have a doublewrite buffer created in the data files. If we are
 upgrading to an InnoDB version which supports multiple tablespaces, then this
 function performs the necessary update operations. If we are in a crash
-recovery, this function loads the pages from double write buffer into memory. */
+recovery, this function loads the pages from double write buffer into memory.
+@return DB_SUCCESS or error code */
 
-void
+dberr_t
 buf_dblwr_init_or_load_pages(
 	os_file_t	file,
 	const char*	path);

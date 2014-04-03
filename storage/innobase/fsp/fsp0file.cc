@@ -243,30 +243,35 @@ Datafile::read_first_page()
 		}
 	}
 
-	m_first_page_buf = static_cast<byte*>
-		(ut_malloc(2 * UNIV_PAGE_SIZE));
+	m_first_page_buf = static_cast<byte*>(
+		ut_malloc(2 * UNIV_PAGE_SIZE_MAX));
 
 	/* Align the memory for a possible read from a raw device */
 
 	m_first_page = static_cast<byte*>
 		(ut_align(m_first_page_buf, UNIV_PAGE_SIZE));
 
-	if (!os_file_read(m_handle, m_first_page, 0, UNIV_PAGE_SIZE)) {
-			ib_logf(IB_LOG_LEVEL_ERROR,
-				"Cannot read first page of '%s'",
-				m_filepath);
+	IORequest	request;
 
-			return(DB_IO_ERROR);
-		}
+	dberr_t	err = os_file_read(
+		request, m_handle, m_first_page, 0,
+		UNIV_PAGE_SIZE_MAX);
 
-	m_flags = fsp_header_get_flags(m_first_page);
+	if (err != DB_SUCCESS) {
 
-	m_space_id = fsp_header_get_space_id(m_first_page);
+		ib_logf(IB_LOG_LEVEL_ERROR,
+			"Cannot read first page of '%s'", m_filepath);
+	} else {
 
-	m_flushed_lsn = mach_read_from_8(
-		m_first_page + FIL_PAGE_FILE_FLUSH_LSN);
+		m_flags = fsp_header_get_flags(m_first_page);
 
-	return(DB_SUCCESS);
+		m_space_id = fsp_header_get_space_id(m_first_page);
+
+		m_flushed_lsn = mach_read_from_8(
+			m_first_page + FIL_PAGE_FILE_FLUSH_LSN);
+	}
+
+	return(err);
 }
 
 /** Free the first page from memory when it is no longer needed. */
@@ -392,12 +397,13 @@ so the Space ID found here must not already be open.
 dberr_t
 Datafile::validate_first_page()
 {
-	m_is_valid = true;
-	const char* error_txt = NULL;
-	char* prev_name;
-	char* prev_filepath;
+	char*		prev_name;
+	char*		prev_filepath;
+	const char*	error_txt = NULL;
 
-	if ((m_first_page == NULL)  && (read_first_page() != DB_SUCCESS)) {
+	m_is_valid = true;
+
+	if (m_first_page == NULL  && read_first_page() != DB_SUCCESS) {
 		error_txt = "Cannot read first page";
 	} else {
 		ut_ad(m_first_page_buf);
@@ -405,7 +411,9 @@ Datafile::validate_first_page()
 	}
 
 	/* Skip the rest of these checks for force_recovery. */
-	if (error_txt == NULL && srv_force_recovery >= SRV_FORCE_IGNORE_CORRUPT) {
+	if (error_txt == NULL
+	    && srv_force_recovery >= SRV_FORCE_IGNORE_CORRUPT) {
+
 		return(DB_SUCCESS);
 	}
 
@@ -490,7 +498,6 @@ pages from the beginning of the .ibd file.
 dberr_t
 Datafile::find_space_id()
 {
-	bool		st;
 	os_offset_t	file_size;
 
 	ut_ad(m_handle != OS_FILE_CLOSED);
@@ -508,30 +515,69 @@ Datafile::find_space_id()
 	in a map.  Find out which space_id is agreed on by majority of the
 	pages.  Choose that space_id. */
 	for (ulint page_size = UNIV_ZIP_SIZE_MIN;
-	     page_size <= UNIV_PAGE_SIZE_MAX; page_size <<= 1) {
+	     page_size <= UNIV_PAGE_SIZE_MAX;
+	     page_size <<= 1) {
 
 		/* map[space_id] = count of pages */
-		std::map<ulint, ulint> verify;
+		typedef std::map<ulint, ulint>  Pages;
 
-		ulint page_count = 64;
-		ulint valid_pages = 0;
+		Pages	verify;
+		ulint	page_count = 64;
+		ulint	valid_pages = 0;
 
 		/* Adjust the number of pages to analyze based on file size */
 		while ((page_count * page_size) > file_size) {
 			--page_count;
 		}
 
-		ib_logf(IB_LOG_LEVEL_INFO, "Page size:%lu Pages to analyze:"
+		ib_logf(IB_LOG_LEVEL_INFO,
+			"Page size: %lu Pages to analyze:"
 			"%lu", page_size, page_count);
 
-		byte* buf = static_cast<byte*>(ut_malloc(2*page_size));
-		byte* page = static_cast<byte*>(ut_align(buf, page_size));
+		byte*	buf = static_cast<byte*>(
+			ut_malloc(2 * UNIV_PAGE_SIZE_MAX));
+
+		byte*	page = static_cast<byte*>(
+			ut_align(buf, UNIV_SECTOR_SIZE));
 
 		for (ulint j = 0; j < page_count; ++j) {
 
-			st = os_file_read(m_handle, page, (j* page_size), page_size);
+			dberr_t	err;
+			ulint	n_bytes = j * page_size;
+			ulint	type = IORequest::READ | IORequest::COMPRESS;
 
-			if (!st) {
+			IORequest	request(type);
+
+			err = os_file_read(
+				request, m_handle, page, n_bytes, page_size);
+
+			if (err == DB_IO_DECOMPRESS_FAIL) {
+
+				/* If the page was compressed on the fly then
+				try and decompress the page */
+
+				n_bytes = os_file_compressed_page_size(page);
+
+				if (n_bytes != ULINT_UNDEFINED) {
+
+					n_bytes += FIL_PAGE_DATA;
+
+					err = os_file_read(
+						request,
+						m_handle, page, page_size,
+						UNIV_PAGE_SIZE_MAX);
+
+					if (err != DB_SUCCESS) {
+
+						ib_logf(IB_LOG_LEVEL_INFO,
+							"READ FAIL:"
+							" page_no:%lu", j);
+						continue;
+					}
+				}
+
+			} else if (err != DB_SUCCESS) {
+
 				ib_logf(IB_LOG_LEVEL_INFO,
 					"READ FAIL: page_no:%lu", j);
 				continue;
@@ -550,8 +596,8 @@ Datafile::find_space_id()
 				page_size, univ_page_size.logical(), true);
 			bool			compressed_ok;
 
-			compressed_ok = !buf_page_is_corrupted(false, page,
-							       compr_page_size);
+			compressed_ok = !buf_page_is_corrupted(
+				false, page, compr_page_size);
 
 			if (noncompressed_ok || compressed_ok) {
 
@@ -560,11 +606,12 @@ Datafile::find_space_id()
 
 				if (space_id > 0) {
 					ib_logf(IB_LOG_LEVEL_INFO,
-						"VALID: space:%lu "
-						"page_no:%lu page_size:%lu",
+						"VALID: space:%lu"
+						" page_no:%lu page_size:%lu",
 						space_id, j, page_size);
-					verify[space_id]++;
+
 					++valid_pages;
+					++verify[space_id];
 				}
 			}
 		}
@@ -572,13 +619,14 @@ Datafile::find_space_id()
 		::ut_free(buf);
 
 		ib_logf(IB_LOG_LEVEL_INFO,
-			"Page size: %lu, Possible space_id count:%lu",
+			"Page size: %lu, possible space_id count:%lu",
 			page_size, (ulint) verify.size());
 
 		const ulint	pages_corrupted = 3;
+
 		for (ulint missed = 0; missed <= pages_corrupted; ++missed) {
 
-			for (std::map<ulint, ulint>::iterator m = verify.begin();
+			for (Pages::iterator m = verify.begin();
 			     m != verify.end();
 			     ++m) {
 
@@ -623,16 +671,16 @@ Datafile::restore_from_doublewrite(
 		in the doublewrite buffer, then the recovery is going to fail
 		now. Hence this is treated as an error. */
 		ib_logf(IB_LOG_LEVEL_ERROR,
-			"Corrupted page " ULINTPF ":" ULINTPF " of datafile '%s'"
-			" could not be found in the doublewrite buffer.",
+			"Corrupted page " ULINTPF ":" ULINTPF " of datafile"
+		        " '%s' could not be found in the doublewrite buffer.",
 			m_space_id, restore_page_no, m_name);
 
 		return(DB_CORRUPTION);
 	}
 
-	const ulint		flags = mach_read_from_4(FSP_HEADER_OFFSET
-							 + FSP_SPACE_FLAGS
-							 + page);
+	const ulint		flags = mach_read_from_4(
+		FSP_HEADER_OFFSET + FSP_SPACE_FLAGS + page);
+
 	const page_size_t	page_size(flags);
 
 	ut_a(page_get_page_no(page) == restore_page_no);
@@ -644,12 +692,11 @@ Datafile::restore_from_doublewrite(
 		m_space_id, restore_page_no, m_name,
 		page_size.physical(), m_filepath);
 
-	if (!os_file_write(m_filepath, m_handle, page, 0,
-			   page_size.physical())) {
-		return(DB_CORRUPTION);
-	}
+	IORequest	request(IORequest::WRITE);
 
-	return(DB_SUCCESS);
+	return(os_file_write(
+			request,
+			m_filepath, m_handle, page, 0, page_size.physical()));
 }
 
 
@@ -793,10 +840,10 @@ RemoteDatafile::create_link_file(
 		return(err);
 	}
 
-	if (!os_file_write(link_filepath, file, filepath,
-			   0, ::strlen(filepath))) {
-		err = DB_ERROR;
-	}
+	IORequest	request(IORequest::WRITE);
+
+	err = os_file_write(
+		request, link_filepath, file, filepath, 0, ::strlen(filepath));
 
 	/* Close the file, we only need it at startup */
 	os_file_close(file);
@@ -816,7 +863,8 @@ RemoteDatafile::delete_link_file(
 	char* link_filepath = fil_make_filepath(NULL, name, ISL, false);
 
 	if (link_filepath != NULL) {
-		os_file_delete_if_exists(innodb_data_file_key, link_filepath, NULL);
+		os_file_delete_if_exists(
+			innodb_data_file_key, link_filepath, NULL);
 
 		::ut_free(link_filepath);
 	}

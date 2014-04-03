@@ -1074,6 +1074,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     command= COM_SHUTDOWN;
   }
   thd->set_query_id(next_query_id());
+  thd->rewritten_query.free();
   thd_manager->inc_thread_running();
 
   if (!(server_command_flags[command] & CF_SKIP_QUESTIONS))
@@ -1149,7 +1150,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     USER_CONN *save_user_connect=
       const_cast<USER_CONN*>(thd->get_user_connect());
     char *save_db= thd->db;
-    uint save_db_length= thd->db_length;
+    size_t save_db_length= thd->db_length;
     Security_context save_security_ctx= *thd->security_ctx;
 
     auth_rc= acl_authenticate(thd, packet_length);
@@ -1314,7 +1315,8 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       THD_STAGE_INFO(thd, stage_starting);
       MYSQL_SET_STATEMENT_TEXT(thd->m_statement_psi, beginning_of_next_stmt, length);
 
-      thd->set_query_and_id(beginning_of_next_stmt, length, next_query_id());
+      thd->set_query(beginning_of_next_stmt, length);
+      thd->set_query_id(next_query_id());
       /*
         Count each statement from the client.
       */
@@ -1348,7 +1350,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       We have name + wildcard in packet, separated by endzero
     */
     arg_end= strend(packet);
-    uint arg_length= arg_end - packet;
+    size_t arg_length= static_cast<size_t>(arg_end - packet);
 
     /* Check given table name length. */
     if (arg_length >= packet_length || arg_length > NAME_LEN)
@@ -1862,7 +1864,6 @@ bool alloc_query(THD *thd, const char *packet, size_t packet_length)
   query[packet_length]= '\0';
 
   thd->set_query(query, packet_length);
-  thd->rewritten_query.free();                 // free here lest PS break
 
   /* Reclaim some memory */
   thd->packet.shrink(thd->variables.net_buffer_length);
@@ -2135,6 +2136,15 @@ mysql_execute_command(THD *thd)
 #ifdef HAVE_REPLICATION
   if (unlikely(thd->slave_thread))
   {
+    // Database filters.
+    if (lex->sql_command != SQLCOM_BEGIN &&
+        lex->sql_command != SQLCOM_COMMIT &&
+        lex->sql_command != SQLCOM_SAVEPOINT &&
+        lex->sql_command != SQLCOM_ROLLBACK &&
+        lex->sql_command != SQLCOM_ROLLBACK_TO_SAVEPOINT &&
+        !rpl_filter->db_ok(thd->db))
+      DBUG_RETURN(0);
+
     if (lex->sql_command == SQLCOM_DROP_TRIGGER)
     {
       /*
@@ -2799,6 +2809,8 @@ case SQLCOM_PREPARE:
              table= table->next_global)
           if (table->lock_type >= TL_WRITE_ALLOW_WRITE)
           {
+            lex->link_first_table_back(create_table, link_to_local);
+
             res= 1;
             my_error(ER_CANT_UPDATE_TABLE_IN_CREATE_TABLE_SELECT, MYF(0),
                      table->table_name, create_info.alias);
@@ -3090,6 +3102,14 @@ end_with_restore_list:
       {
         DBUG_ASSERT(all_tables->view != 0);
         DBUG_PRINT("info", ("Switch to multi-update"));
+        if (select_lex->order_list.elements ||
+            select_lex->select_limit)
+        { // Clauses not supported by multi-update: can't switch.
+          my_error(ER_VIEW_PREVENT_UPDATE, MYF(0),
+                   all_tables->alias, "UPDATE", all_tables->alias);
+          res= true;
+          break;
+        }
         if (!thd->in_sub_stmt)
           thd->query_plan.set_query_plan(SQLCOM_UPDATE_MULTI, lex,
                                          !thd->stmt_arena->is_conventional());
@@ -5244,11 +5264,29 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
               thd->variables.gtid_next.type == GTID_GROUP &&
               thd->owned_gtid.sidno != 0 &&
               (thd->lex->sql_command == SQLCOM_COMMIT ||
-               stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END)))
+               stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END) ||
+               thd->lex->sql_command == SQLCOM_CREATE_TABLE ||
+               thd->lex->sql_command == SQLCOM_DROP_TABLE))
           {
-            // This is executed at the end of a DDL statement or after
-            // COMMIT.  It ensures that an empty group is logged if
-            // needed.
+            /*
+              This ensures that an empty transaction is logged if
+              needed. It is executed at the end of an implicitly or
+              explicitly committing statement, or after CREATE
+              TEMPORARY TABLE or DROP TEMPORARY TABLE.
+
+              CREATE/DROP TEMPORARY do not count as implicitly
+              committing according to stmt_causes_implicit_commit(),
+              but are written to the binary log as DDL (not between
+              BEGIN/COMMIT). Thus we need special cases for these
+              statements in the condition above. Hence the clauses for
+              for SQLCOM_CREATE_TABLE and SQLCOM_DROP_TABLE above.
+
+              Thus, for base tables, SQLCOM_[CREATE|DROP]_TABLE match
+              both the stmt_causes_implicit_commit clause and the
+              thd->lex->sql_command == SQLCOM_* clause; for temporary
+              tables they match only thd->lex->sql_command ==
+              SQLCOM_*.
+            */
             error= gtid_empty_group_log_and_cleanup(thd);
           }
           MYSQL_QUERY_EXEC_DONE(error);
@@ -5300,7 +5338,7 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
 
 
 #ifdef HAVE_REPLICATION
-/*
+/**
   Usable by the replication SQL thread only: just parse a query to know if it
   can be ignored because of replicate-*-table rules.
 
@@ -5313,28 +5351,39 @@ void mysql_parse(THD *thd, Parser_state *parser_state)
 bool mysql_test_parse_for_slave(THD *thd)
 {
   LEX *lex= thd->lex;
-  bool error= 0;
+  bool ignorable= false;
   sql_digest_state *parent_digest= thd->m_digest;
   PSI_statement_locker *parent_locker= thd->m_statement_psi;
   DBUG_ENTER("mysql_test_parse_for_slave");
 
+  DBUG_ASSERT(thd->slave_thread);
+
   Parser_state parser_state;
-  if (!(error= parser_state.init(thd, thd->query().str, thd->query().length)))
+  if (parser_state.init(thd, thd->query().str, thd->query().length) == 0)
   {
     lex_start(thd);
     mysql_reset_thd_for_next_command(thd);
 
     thd->m_digest= NULL;
     thd->m_statement_psi= NULL;
-    if (!parse_sql(thd, & parser_state, NULL) &&
-        all_tables_not_ok(thd, lex->select_lex->table_list.first))
-      error= 1;                  /* Ignore question */
+    if (parse_sql(thd, & parser_state, NULL) == 0)
+    {
+      if (all_tables_not_ok(thd, lex->select_lex->table_list.first))
+        ignorable= true;
+      else if (lex->sql_command != SQLCOM_BEGIN &&
+               lex->sql_command != SQLCOM_COMMIT &&
+               lex->sql_command != SQLCOM_SAVEPOINT &&
+               lex->sql_command != SQLCOM_ROLLBACK &&
+               lex->sql_command != SQLCOM_ROLLBACK_TO_SAVEPOINT &&
+               !rpl_filter->db_ok(thd->db))
+        ignorable= true;
+    }
     thd->m_digest= parent_digest;
     thd->m_statement_psi= parent_locker;
     thd->end_statement();
   }
   thd->cleanup_after_query();
-  DBUG_RETURN(error);
+  DBUG_RETURN(ignorable);
 }
 #endif
 
@@ -5502,11 +5551,10 @@ TABLE_LIST *st_select_lex::add_table_to_list(THD *thd,
                                              LEX_STRING *option)
 {
   TABLE_LIST *ptr;
-  TABLE_LIST *previous_table_ref; /* The table preceding the current one. */
+  TABLE_LIST *previous_table_ref= NULL; /* The table preceding the current one. */
   char *alias_str;
   LEX *lex= thd->lex;
   DBUG_ENTER("add_table_to_list");
-  LINT_INIT(previous_table_ref);
 
   if (!table)
     DBUG_RETURN(0);				// End of memory
@@ -6595,7 +6643,7 @@ LEX_USER *get_current_user(THD *thd, LEX_USER *user)
 */
 
 bool check_string_byte_length(LEX_STRING *str, const char *err_msg,
-                              uint max_byte_length)
+                              size_t max_byte_length)
 {
   if (str->length <= max_byte_length)
     return FALSE;
@@ -6623,7 +6671,7 @@ bool check_string_byte_length(LEX_STRING *str, const char *err_msg,
 
 
 bool check_string_char_length(LEX_STRING *str, const char *err_msg,
-                              uint max_char_length, const CHARSET_INFO *cs,
+                              size_t max_char_length, const CHARSET_INFO *cs,
                               bool no_error)
 {
   int well_formed_error;
@@ -6659,7 +6707,7 @@ C_MODE_START
 int test_if_data_home_dir(const char *dir)
 {
   char path[FN_REFLEN];
-  int dir_len;
+  size_t dir_len;
   DBUG_ENTER("test_if_data_home_dir");
 
   if (!dir)

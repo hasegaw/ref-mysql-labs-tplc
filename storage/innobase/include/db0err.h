@@ -124,7 +124,6 @@ enum dberr_t {
 	DB_ONLINE_LOG_TOO_BIG,		/*!< Modification log grew too big
 					during online index creation */
 
-	DB_IO_ERROR,			/*!< Generic IO error */
 	DB_IDENTIFIER_TOO_LONG,		/*!< Identifier name too long */
 	DB_FTS_EXCEED_RESULT_CACHE_LIMIT,	/*!< FTS query memory
 					exceeds result cache limit */
@@ -132,6 +131,16 @@ enum dberr_t {
 	DB_CANNOT_OPEN_FILE,		/*!< Cannot open a file */
 	DB_FTS_TOO_MANY_WORDS_IN_PHRASE,
 					/*< Too many words in a phrase */
+
+	DB_IO_ERROR = 100,		/*!< Generic IO error */
+
+	DB_IO_DECOMPRESS_FAIL,		/*!< Failure to decompress a page
+					after reading it from disk */
+
+	DB_IO_NO_PUNCH_HOLE,		/*!< Punch hole not supported */
+
+	DB_IO_PARTIAL_FAILED,		/*!< Partial IO request failed */
+
 
 	/* The following are partial failure codes */
 	DB_FAIL = 1000,
@@ -159,7 +168,8 @@ enum dberr_t {
 					type of errors */
 
 	DB_TABLESPACE_TRUNCATED,	/*!< tablespace was truncated */
-	DB_TABLE_CORRUPT		/*!< Table/clustered index is corrupted */
+	DB_TABLE_CORRUPT		/*!< Table/clustered index is
+					corrupted */
 };
 
 #endif
